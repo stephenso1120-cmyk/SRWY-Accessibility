@@ -4,9 +4,9 @@ using System.Reflection;
 using System.Runtime.InteropServices;
 using System.Threading;
 using MelonLoader;
-using HarmonyLib;
 using UnityEngine;
 using Il2CppInterop.Runtime;
+using Il2CppInterop.Runtime.Injection;
 using Il2CppCom.BBStudio.SRTeam.Inputs;
 using Il2CppCom.BBStudio.SRTeam.UIs;
 
@@ -349,16 +349,25 @@ namespace SRWYAccess
                 return;
             }
 
-            // Phase 8: Apply Harmony patch to InputManager.Update()
+            // Phase 8: Create MonoBehaviour on main thread via ClassInjector
+            // Unity's Update() is called from native C++ directly on IL2CPP methods,
+            // so Harmony patches on proxy Update() methods don't fire.
+            // ClassInjector registers a real IL2CPP type that Unity can call Update() on.
             try
             {
-                var harmony = new HarmonyLib.Harmony("com.srwyaccess.mod");
-                harmony.PatchAll(typeof(SRWYAccessMod).Assembly);
-                DebugHelper.Write("Harmony patch applied to InputManager.Update().");
+                ClassInjector.RegisterTypeInIl2Cpp<ModUpdateBehaviour>();
+                DebugHelper.Write("ClassInjector: ModUpdateBehaviour registered.");
+
+                var go = new GameObject("SRWYAccess_Update");
+                UnityEngine.Object.DontDestroyOnLoad(go);
+                go.hideFlags = HideFlags.HideAndDontSave;
+                go.AddComponent<ModUpdateBehaviour>();
+                DebugHelper.Write("ModUpdateBehaviour attached to GameObject.");
             }
             catch (Exception ex)
             {
-                DebugHelper.Write($"Harmony patch FAILED: {ex}");
+                DebugHelper.Write($"ClassInjector/GameObject setup FAILED: {ex}");
+                DebugHelper.Flush();
                 return;
             }
 
@@ -375,6 +384,7 @@ namespace SRWYAccess
             _initialized = true;
             ScreenReaderOutput.Say(Loc.Get("mod_loaded"));
             DebugHelper.Write("Fully initialized. Main thread updates active.");
+            DebugHelper.Flush();
 
             // Phase 10: Detach from IL2CPP and exit init thread
             try
@@ -390,7 +400,7 @@ namespace SRWYAccess
         }
 
         /// <summary>
-        /// Called every frame from Harmony postfix on InputManager.Update().
+        /// Called every frame from ModUpdateBehaviour.Update().
         /// Runs on Unity main thread - all IL2CPP access is safe.
         /// </summary>
         internal static void OnMainThreadUpdate()
@@ -734,13 +744,15 @@ namespace SRWYAccess
     }
 
     /// <summary>
-    /// Harmony patch: injects mod update into InputManager.Update() on the Unity main thread.
-    /// InputManager is a persistent SingletonMonoBehaviour that runs every frame.
+    /// Custom MonoBehaviour injected via ClassInjector.
+    /// Unity calls Update() every frame on the main thread.
+    /// DontDestroyOnLoad keeps it alive across scene transitions.
     /// </summary>
-    [HarmonyPatch(typeof(InputManager), "Update")]
-    internal static class InputManagerUpdatePatch
+    internal class ModUpdateBehaviour : MonoBehaviour
     {
-        static void Postfix()
+        public ModUpdateBehaviour(IntPtr ptr) : base(ptr) { }
+
+        void Update()
         {
             try
             {
