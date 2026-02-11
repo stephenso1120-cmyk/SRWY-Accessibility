@@ -2,23 +2,16 @@ namespace SRWYAccess
 {
     /// <summary>
     /// Centralized configuration for all mod thresholds, timings, and limits.
-    /// Grouped by subsystem for easy tuning. All values are in poll cycles
-    /// (1 cycle = ~100ms) unless otherwise noted.
+    /// Grouped by subsystem for easy tuning.
+    ///
+    /// Main thread architecture: mod logic runs on Unity main thread via
+    /// Harmony postfix on InputManager.Update(). Poll cycles are throttled
+    /// to every PollFrameInterval frames (~100ms at 60fps).
+    /// Values in "poll cycles" = PollFrameInterval frames each.
     /// </summary>
     internal static class ModConfig
     {
-        // ===== Poll Loop (SRWYAccessMod / ModCore) =====
-
-        /// <summary>Main poll interval in milliseconds.</summary>
-        public const int PollIntervalMs = 100;
-
-        /// <summary>Number of sleep chunks per poll cycle. Each chunk is followed by
-        /// an IL2CPP safe-point (P/Invoke to il2cpp_domain_get). SleepChunks * SleepChunkMs
-        /// should equal PollIntervalMs.</summary>
-        public const int SleepChunks = 10;
-
-        /// <summary>Duration of each sleep chunk in milliseconds.</summary>
-        public const int SleepChunkMs = 10;
+        // ===== Main Thread Poll (ModCore) =====
 
         /// <summary>Initial delay before starting mod (ms). Lets MelonLoader finish init.</summary>
         public const int InitDelayMs = 8000;
@@ -26,74 +19,30 @@ namespace SRWYAccess
         /// <summary>Max attempts to wait for IL2CPP / InputManager (each 500ms).</summary>
         public const int MaxInitAttempts = 120;
 
+        /// <summary>Run handler updates every N frames. 6 frames ≈ 100ms at 60fps.</summary>
+        public const int PollFrameInterval = 6;
+
         /// <summary>Round-robin search slots: 0=GenericMenuReader, 1=Tutorial, 2=Adventure.</summary>
         public const int TotalSearchSlots = 3;
 
-        /// <summary>Initial GST pause cycles on startup (let InputManager stabilize).</summary>
-        public const int InitialGstPause = 15;
+        /// <summary>Search cooldown after mode changes (poll cycles).
+        /// Lets Unity finish loading new scene objects before we search.
+        /// 3 cycles = ~300ms at 60fps.</summary>
+        public const int SearchCooldownAfterChange = 3;
 
-        /// <summary>Minimum stabilizeWait value to exit stabilization.
-        /// With SoftStabilizeCycles=3, gives 5 actual pointer-monitoring cycles (8-3=5).</summary>
-        public const int StabilityThreshold = 8;
+        /// <summary>Cooldown after errors (poll cycles). 20 cycles ≈ 2s.</summary>
+        public const int ErrorCooldownCycles = 20;
 
-        /// <summary>Maximum cycles to wait for stability before proceeding anyway.</summary>
-        public const int MaxStabilizeWait = 100;
-
-        /// <summary>Soft stabilize: first N cycles of stabilization skip ALL IL2CPP calls
-        /// (including GST.Update and GetCurrentInputBehaviour). Prevents AV crashes
-        /// during scene loading when InputManager internals are being modified by
-        /// the main thread. After this phase, lightweight pointer monitoring begins.</summary>
-        public const int SoftStabilizeCycles = 3;
-
-        /// <summary>Post-stabilization cooldown cycles before allowing FindObjectOfType.
-        /// Short: pointer was actively confirmed stable during monitoring.</summary>
-        public const int PostStabilityCooldown = 5;
-
-        /// <summary>Cycles of NONE-loading before probing for active UI handlers.
+        /// <summary>Poll cycles of NONE-loading before probing for active UI handlers.
         /// Must be long enough to survive the slowest scene transitions (5-6s observed).
-        /// FindObjectsOfType in the probe crashes during scene loading.</summary>
+        /// 80 cycles * ~100ms = 8 seconds.</summary>
         public const int NoneProbeThreshold = 80;
 
-        /// <summary>Heartbeat log interval in cycles (~30 seconds).</summary>
+        /// <summary>Heartbeat log interval in poll cycles (~30 seconds).</summary>
         public const int HeartbeatInterval = 300;
 
-        /// <summary>Max cycles waiting for battle result before timeout.</summary>
+        /// <summary>Max poll cycles waiting for battle result before timeout.</summary>
         public const int ResultTimeout = 200;
-
-        // ===== GST Pause Values (cycles) =====
-
-        /// <summary>GST pause when NoModeMatched (scene transition).</summary>
-        public const int GstPauseNoMode = 2;
-
-        /// <summary>GST pause when entering BATTLE_SCENE.</summary>
-        public const int GstPauseBattle = 3;
-
-        /// <summary>GST pause when entering ADVENTURE.</summary>
-        public const int GstPauseAdventure = 7;
-
-        /// <summary>GST pause when leaving ADVENTURE.</summary>
-        public const int GstPauseFromAdventure = 5;
-
-        /// <summary>GST pause when leaving BATTLE_SCENE or NONE.
-        /// Pointer monitoring provides active safety during stabilization.</summary>
-        public const int GstPauseFromBattleOrNone = 7;
-
-        /// <summary>GST pause for postTactical transitions.
-        /// Increased from 1: this transition is crash-prone (TACTICAL->NONE->BATTLE).</summary>
-        public const int GstPausePostTactical = 2;
-
-        /// <summary>GST pause for generic transitions.</summary>
-        public const int GstPauseGeneric = 2;
-
-        /// <summary>GST pause on poll error.</summary>
-        public const int GstPauseOnError = 5;
-
-        /// <summary>GST pause when ADH refs released (preemptive).</summary>
-        public const int GstPauseAdhRelease = 5;
-
-        /// <summary>GST pause after post-stabilize mode change.
-        /// Short: pointer was just confirmed stable for 5 consecutive checks.</summary>
-        public const int GstPausePostStabilize = 2;
 
         // ===== GenericMenuReader =====
 
@@ -117,9 +66,7 @@ namespace SRWYAccess
         /// <summary>Cache re-validation age (polls since BattleSceneUI cached).</summary>
         public const int BattleCacheMaxAge = 50;
 
-        /// <summary>Unchanged subtitle cycles before entering stale mode.
-        /// Lower = safer (less time using cached ref on potentially-destroyed object).
-        /// At 300ms poll interval: 2 = 600ms window before switching to safe probes.</summary>
+        /// <summary>Unchanged subtitle cycles before entering stale mode.</summary>
         public const int BattleStaleLimit = 2;
 
         /// <summary>Probe interval when in stale mode.</summary>
@@ -131,9 +78,7 @@ namespace SRWYAccess
         /// <summary>Max retries for GetComponentsInChildren name reads.</summary>
         public const int BattleNamesMaxRetries = 3;
 
-        /// <summary>Permanent stop threshold for stale dialog counter.
-        /// At 300ms poll interval: 100 = ~30s of stale time. Limits total
-        /// cached ref exposure during battle ending phase.</summary>
+        /// <summary>Permanent stop threshold for stale dialog counter.</summary>
         public const int BattleStalePermanentStop = 100;
 
         // ===== AdventureDialogueHandler =====

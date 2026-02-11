@@ -4,12 +4,13 @@ using System.Reflection;
 using System.Runtime.InteropServices;
 using System.Threading;
 using MelonLoader;
+using HarmonyLib;
 using UnityEngine;
 using Il2CppInterop.Runtime;
 using Il2CppCom.BBStudio.SRTeam.Inputs;
 using Il2CppCom.BBStudio.SRTeam.UIs;
 
-[assembly: MelonInfo(typeof(SRWYAccess.SRWYAccessMod), "SRWYAccess", "0.1.0", "SRWYAccess Team")]
+[assembly: MelonInfo(typeof(SRWYAccess.SRWYAccessMod), "SRWYAccess", "0.2.0", "SRWYAccess Team")]
 [assembly: MelonGame("Bandai Namco Entertainment", "SUPER ROBOT WARS Y")]
 
 namespace SRWYAccess
@@ -18,10 +19,6 @@ namespace SRWYAccess
     {
         static SRWYAccessMod()
         {
-            // Must start from static constructor because MelonLoader's Support Module
-            // fails to load on this game (Unity 2022 IL2CPP), so OnInitializeMelon
-            // and OnUpdate callbacks never fire. The background thread uses a long
-            // initial delay to avoid interfering with MelonLoader's init sequence.
             DebugHelper.Write("Static constructor: scheduling mod start.");
             ModCore.EnsureStarted();
         }
@@ -42,14 +39,10 @@ namespace SRWYAccess
 
         static DebugHelper()
         {
-            // Use temp directory - always writable, unlike Program Files
             LogPath = Path.Combine(Path.GetTempPath(), "SRWYAccess_debug.log");
 
             try
             {
-                // Fresh log each session - StreamWriter with buffered writes.
-                // AutoFlush=false: we flush every N writes to reduce disk IO
-                // while still capturing data before crashes.
                 _writer = new StreamWriter(LogPath, false, System.Text.Encoding.UTF8)
                 {
                     AutoFlush = false
@@ -59,7 +52,6 @@ namespace SRWYAccess
             }
             catch { }
 
-            // Leave a breadcrumb in the game directory pointing to the real log
             try
             {
                 string gameDir = AppDomain.CurrentDomain.BaseDirectory;
@@ -82,15 +74,14 @@ namespace SRWYAccess
                     _writer.WriteLine(msg);
                     _writeCount++;
                     if (_writeCount % ModConfig.LogFlushInterval == 0)
+                    {
                         _writer.Flush();
+                    }
                 }
                 catch { }
             }
         }
 
-        /// <summary>
-        /// Flush buffered log entries to disk. Call on shutdown or important events.
-        /// </summary>
         internal static void Flush()
         {
             lock (_writeLock)
@@ -100,9 +91,6 @@ namespace SRWYAccess
             }
         }
 
-        /// <summary>
-        /// Close the log writer. Call on process exit.
-        /// </summary>
         internal static void Close()
         {
             lock (_writeLock)
@@ -119,7 +107,8 @@ namespace SRWYAccess
     }
 
     /// <summary>
-    /// Core mod logic running on a background polling thread.
+    /// Core mod logic. Initialization runs on a background thread, then a Harmony
+    /// patch on InputManager.Update() runs all handler logic on the Unity main thread.
     /// </summary>
     internal static class ModCore
     {
@@ -128,12 +117,14 @@ namespace SRWYAccess
 
         private const int VK_OEM_4 = 0xDB; // [ key
         private const int VK_OEM_6 = 0xDD; // ] key
-        private const int VK_R = 0x52;     // R key (repeat result)
+        private const int VK_R = 0x52;     // R key
 
         private static bool _started;
+        private static volatile bool _initialized;
         private static volatile bool _shutdownRequested;
-        private static Thread _pollThread;
         private static readonly object _lock = new object();
+
+        // Handler instances (created during init, used on main thread)
         private static GenericMenuReader _genericMenuReader;
         private static DialogHandler _dialogHandler;
         private static TutorialHandler _tutorialHandler;
@@ -143,10 +134,24 @@ namespace SRWYAccess
         private static TacticalMapHandler _tacticalMapHandler;
         private static ScreenReviewManager _screenReviewManager;
 
-        /// <summary>
-        /// Thread-safe: ensures the polling thread is started exactly once.
-        /// Called from both static constructor and OnInitializeMelon as fallback.
-        /// </summary>
+        // Main thread state (only accessed from main thread after _initialized = true)
+        private static int _frameCount;
+        private static int _searchSlot;
+        private static int _searchCooldown;
+        private static int _noneLoadingCount;
+        private static int _heartbeat;
+        private static int _battlePoll;
+        private static int _resultPoll;
+        private static int _resultTimeout;
+        private static bool _postTitle;
+        private static bool _postTactical;
+        private static bool _noneProbeActive;
+        private static bool _resultPending;
+        private static InputManager.InputMode _lastKnownMode;
+        private static bool _lastKeyR;
+        private static bool _lastKeyLeft;
+        private static bool _lastKeyRight;
+
         internal static void EnsureStarted()
         {
             lock (_lock)
@@ -157,10 +162,10 @@ namespace SRWYAccess
 
             try
             {
-                _pollThread = new Thread(RunLoop);
-                _pollThread.IsBackground = true;
-                _pollThread.Start();
-                DebugHelper.Write("Mod polling thread started.");
+                var initThread = new Thread(Initialize);
+                initThread.IsBackground = true;
+                initThread.Start();
+                DebugHelper.Write("Init thread started.");
             }
             catch (Exception ex)
             {
@@ -168,11 +173,6 @@ namespace SRWYAccess
             }
         }
 
-        /// <summary>
-        /// Check if Il2CppInterop runtime is initialized by checking BaseHost
-        /// (a simple container in Il2CppInterop.Common) via reflection.
-        /// Safe: BaseHost's static constructor does NOT depend on UnityVersionHandler.
-        /// </summary>
         private static bool IsIl2CppInteropReady()
         {
             try
@@ -182,7 +182,6 @@ namespace SRWYAccess
                     var baseHostType = asm.GetType("Il2CppInterop.Common.Host.BaseHost");
                     if (baseHostType == null) continue;
 
-                    // Check all static fields for a non-null host instance
                     var fields = baseHostType.GetFields(
                         BindingFlags.Static | BindingFlags.NonPublic | BindingFlags.Public);
                     foreach (var f in fields)
@@ -200,39 +199,35 @@ namespace SRWYAccess
             return false;
         }
 
-        private static void RunLoop()
+        private static void Initialize()
         {
-            // Wait for MelonLoader to finish its initialization (support module, scene hooks, etc.)
-            // before touching any Il2Cpp or Unity APIs
-            DebugHelper.Write($"RunLoop: Waiting {ModConfig.InitDelayMs}ms for MelonLoader to finish init...");
+            // Phase 1: Wait for MelonLoader init
+            DebugHelper.Write($"Initialize: Waiting {ModConfig.InitDelayMs}ms for MelonLoader to finish init...");
             Thread.Sleep(ModConfig.InitDelayMs);
 
-            // Register this thread with the IL2CPP GC.
-            // Without this, any IL2CPP allocation on our thread can trigger
-            // a GC "Collecting from unknown thread" fatal crash.
+            // Phase 2: Attach to IL2CPP domain (needed for init operations from background thread)
             try
             {
                 var domain = IL2CPP.il2cpp_domain_get();
                 if (domain != IntPtr.Zero)
                 {
                     IL2CPP.il2cpp_thread_attach(domain);
-                    DebugHelper.Write("RunLoop: Thread attached to IL2CPP domain.");
+                    DebugHelper.Write("Initialize: Thread attached to IL2CPP domain.");
                 }
                 else
                 {
-                    DebugHelper.Write("RunLoop: WARNING - il2cpp_domain_get returned null");
+                    DebugHelper.Write("Initialize: WARNING - il2cpp_domain_get returned null");
                 }
             }
             catch (Exception ex)
             {
-                DebugHelper.Write($"RunLoop: Thread attach failed: {ex.Message}");
+                DebugHelper.Write($"Initialize: Thread attach failed: {ex.Message}");
             }
 
-            DebugHelper.Write("RunLoop: Waiting for Il2Cpp...");
-
-            // Phase 1: Wait for Il2Cpp InputManager class to be available
+            // Phase 3: Wait for IL2CPP InputManager class
+            DebugHelper.Write("Initialize: Waiting for Il2Cpp...");
             bool il2cppReady = false;
-            for (int i = 0; i < ModConfig.MaxInitAttempts; i++)
+            for (int i = 0; i < ModConfig.MaxInitAttempts && !_shutdownRequested; i++)
             {
                 Thread.Sleep(500);
                 try
@@ -258,7 +253,7 @@ namespace SRWYAccess
                 return;
             }
 
-            // Phase 2: Initialize Tolk
+            // Phase 4: Initialize Tolk
             try
             {
                 ScreenReaderOutput.Initialize();
@@ -272,10 +267,9 @@ namespace SRWYAccess
                 return;
             }
 
-            // Phase 3: Wait for Il2CppInterop runtime to be ready
-            // (FindObjectOfType needs this; calling too early permanently poisons type initializers)
+            // Phase 5: Wait for Il2CppInterop runtime
             DebugHelper.Write("Waiting for Il2CppInterop runtime (BaseHost check)...");
-            for (int i = 0; i < ModConfig.MaxInitAttempts; i++)
+            for (int i = 0; i < ModConfig.MaxInitAttempts && !_shutdownRequested; i++)
             {
                 Thread.Sleep(500);
                 try
@@ -291,16 +285,15 @@ namespace SRWYAccess
                     DebugHelper.Write($"Attempt {i}: Il2CppInterop not ready yet.");
             }
 
-            // Verify Il2CppInterop is ready before proceeding
             if (!IsIl2CppInteropReady())
             {
                 DebugHelper.Write("WARNING: Il2CppInterop runtime never became ready. Continuing with caution...");
             }
 
-            // Phase 4: Wait for InputManager to exist in the scene
+            // Phase 6: Wait for InputManager to exist in the scene
             DebugHelper.Write("Looking for InputManager (FindObjectOfType)...");
             bool singletonReady = false;
-            for (int i = 0; i < ModConfig.MaxInitAttempts; i++)
+            for (int i = 0; i < ModConfig.MaxInitAttempts && !_shutdownRequested; i++)
             {
                 Thread.Sleep(500);
                 try
@@ -331,7 +324,7 @@ namespace SRWYAccess
                 return;
             }
 
-            // Phase 5: Initialize mod systems
+            // Phase 7: Initialize mod systems
             try
             {
                 Loc.Initialize();
@@ -348,8 +341,7 @@ namespace SRWYAccess
                     _adventureDialogueHandler, _battleSubtitleHandler,
                     _battleResultHandler, _tacticalMapHandler);
 
-                ScreenReaderOutput.Say(Loc.Get("mod_loaded"));
-                DebugHelper.Write("Fully initialized. Entering poll loop.");
+                _lastKnownMode = GameStateTracker.CurrentMode;
             }
             catch (Exception ex)
             {
@@ -357,504 +349,335 @@ namespace SRWYAccess
                 return;
             }
 
-            // Register shutdown handler so the poll loop exits cleanly
-            // when the game process is closing. Without this, the background
-            // thread can hang in IL2CPP calls during runtime teardown.
+            // Phase 8: Apply Harmony patch to InputManager.Update()
+            try
+            {
+                var harmony = new HarmonyLib.Harmony("com.srwyaccess.mod");
+                harmony.PatchAll(typeof(SRWYAccessMod).Assembly);
+                DebugHelper.Write("Harmony patch applied to InputManager.Update().");
+            }
+            catch (Exception ex)
+            {
+                DebugHelper.Write($"Harmony patch FAILED: {ex}");
+                return;
+            }
+
+            // Register shutdown handler
             AppDomain.CurrentDomain.ProcessExit += (s, e) =>
             {
+                _initialized = false;
                 _shutdownRequested = true;
-                // Interrupt Thread.Sleep so the loop can check the flag immediately
-                try { _pollThread?.Interrupt(); } catch { }
-                // Wait up to 2s for the poll thread to detach from IL2CPP and exit.
-                // If it doesn't exit in time, the process will terminate anyway
-                // (IsBackground=true), but clean detach prevents IL2CPP deadlocks.
-                try { _pollThread?.Join(2000); } catch { }
-                // Clean up native resources
                 ScreenReaderOutput.Shutdown();
                 DebugHelper.Close();
             };
 
-            // Phase 6: Main polling loop (~10 times per second)
-            //
-            // SAFETY: FindObjectOfType/FindObjectsOfType is not thread-safe.
-            // Calling from background thread during scene transitions causes
-            // native crashes (AccessViolationException, uncatchable in .NET 6).
-            //
-            // Protection strategy:
-            //  1. GameStateTracker uses InputManager.instance (static field read)
-            //     which is safe during scene transitions. It runs EVERY cycle.
-            //  2. UI handlers use FindObjectOfType (dangerous). They are frozen
-            //     for several seconds after state changes or handler loss.
-            //  3. Only ONE FindObjectOfType/FindObjectsOfType runs per cycle (round-robin).
-            //  4. GenericMenuReader uses controlBehaviour matching to find the
-            //     active handler without needing type-specific searches.
-            int searchSlot = 0;
-            int gstPause = ModConfig.InitialGstPause;
+            // Phase 9: Activate main thread updates
+            _initialized = true;
+            ScreenReaderOutput.Say(Loc.Get("mod_loaded"));
+            DebugHelper.Write("Fully initialized. Main thread updates active.");
 
-            // Timer-based stabilization: after state changes, wait a fixed number
-            // of cycles with NO IL2CPP access before resuming handler polling.
-            bool stabilizing = false;
-            int stabilizeWait = 0;
-            int heartbeat = 0;
-            int searchCooldown = 0;
-            int battlePoll = 0;    // battle subtitle polling rate limiter
-            int debugTraceCount = 0; // temporary: trace first N cycles after stabilize
-            bool lastKeyLeft = false;  // [ key previous state (screen review browse prev)
-            bool lastKeyRight = false; // ] key previous state (screen review browse next)
-            bool lastKeyR = false;     // R key previous state (screen review read all)
-            int resultPoll = 0;        // battle result polling rate limiter
-            var lastKnownMode = GameStateTracker.CurrentMode;
-            // The game's title menu runs under InputMode.NONE, not MAIN_MENU.
-            // Track when we transition from TITLE to allow handlers during NONE.
-            bool postTitle = false;
-            // Tactical menus run under InputMode.NONE too. Track when we've
-            // been in a tactical state so NONE is treated as menu, not loading.
-            bool postTactical = false;
-            // After save load, InputMode may stay NONE even though the game is
-            // running. Track consecutive NONE loading cycles and probe after timeout.
-            int noneLoadingCount = 0;
-            // 3s of NONE loading → probe for active handlers
-            // After battle ends, result screen shows in TACTICAL_PART (not NONE).
-            bool resultPending = false;
-            int resultTimeout = 0;
-            // NONE probe mode: handler was found via NONE probe (not from a known
-            // state transition like tactical→NONE). Be extra cautious with
-            // FindObjectOfType calls since the game could transition at any time.
-            bool noneProbeActive = false;
-
-            while (!_shutdownRequested)
-            {
-                // Simple sleep. Exit hang is handled by ProcessExit handler
-                // (sets _shutdownRequested + Thread.Interrupt to wake from sleep).
-                // Previous approaches (detach/attach per cycle, sleep chunks with
-                // il2cpp_domain_get) both caused AV crashes.
-                try { Thread.Sleep(ModConfig.PollIntervalMs); }
-                catch (ThreadInterruptedException) { break; }
-
-                try
-                {
-
-                    // Heartbeat: log every ~30 seconds to track crash location
-                    heartbeat++;
-                    if (heartbeat % ModConfig.HeartbeatInterval == 0)
-                    {
-                        DebugHelper.Write($"Heartbeat #{heartbeat / 300}: mode={lastKnownMode}, stabilizing={stabilizing}, gstPause={gstPause}, postTitle={postTitle}, postTactical={postTactical}, resultPending={resultPending}");
-                    }
-
-                    // GST pause: skip ALL IL2CPP calls during scene transitions.
-                    if (gstPause > 0)
-                    {
-                        gstPause--;
-                        continue;
-                    }
-
-                    // Soft stabilize: after gstPause expires, skip ALL IL2CPP calls
-                    // for the first N cycles of stabilization. This prevents AV crashes
-                    // in GetCurrentInputBehaviour() during scene loading, where the main
-                    // thread is still setting up InputManager internals.
-                    if (stabilizing && stabilizeWait < ModConfig.SoftStabilizeCycles)
-                    {
-                        stabilizeWait++;
-                        continue;
-                    }
-
-                    // Active stabilization: use lightweight CheckPointerStable() (2-3
-                    // IL2CPP calls) instead of full Update() (17+ calls). If the pointer
-                    // changes during monitoring, extend the wait. Full mode detection
-                    // only runs ONCE after pointer confirmed stable for N cycles.
-                    if (stabilizing)
-                    {
-                        bool pointerStable = GameStateTracker.CheckPointerStable();
-
-                        if (!pointerStable)
-                        {
-                            // Pointer changed or unavailable: scene still transitioning.
-                            // Reset to just after soft phase to extend monitoring.
-                            if (stabilizeWait > ModConfig.SoftStabilizeCycles)
-                            {
-                                DebugHelper.Write($"Stabilize: pointer unstable at wait={stabilizeWait}, resetting");
-                                stabilizeWait = ModConfig.SoftStabilizeCycles;
-                            }
-                            stabilizeWait++;
-
-                            // Safety: don't wait forever
-                            if (stabilizeWait >= ModConfig.MaxStabilizeWait)
-                            {
-                                stabilizing = false;
-                                searchCooldown = ModConfig.PostStabilityCooldown;
-                                DebugHelper.Write($"Stabilized (max wait reached: {stabilizeWait} cycles)");
-                            }
-                            continue;
-                        }
-
-                        stabilizeWait++;
-                        if (stabilizeWait >= ModConfig.StabilityThreshold)
-                        {
-                            stabilizing = false;
-                            searchCooldown = ModConfig.PostStabilityCooldown;
-                            debugTraceCount = 0;
-                            DebugHelper.Write($"Stabilized after {stabilizeWait} wait cycles ({stabilizeWait * 100}ms total)");
-
-                            // Full mode detection now that pointer is confirmed stable.
-                            // The 17 GetInputBehaviour calls are much safer here because
-                            // the pointer hasn't changed for N consecutive cycles.
-                            GameStateTracker.Update();
-                            DebugHelper.Flush();
-
-                            var settledMode = GameStateTracker.CurrentMode;
-                            if (settledMode != lastKnownMode)
-                            {
-                                // Mode changed during stabilization (e.g. NONE->BATTLE_SCENE
-                                // while we were stabilizing from TACTICAL->NONE).
-                                DebugHelper.Write($"Post-stabilize mode change: {lastKnownMode} -> {settledMode}");
-                                HandleModeChange(settledMode, ref lastKnownMode, ref postTitle,
-                                    ref postTactical, ref noneProbeActive, ref resultPending,
-                                    ref resultTimeout);
-
-                                _screenReviewManager?.Clear();
-                                // Short re-stabilization: skip soft phase since pointer
-                                // was just confirmed stable for multiple cycles.
-                                stabilizing = true;
-                                stabilizeWait = ModConfig.SoftStabilizeCycles;
-                                gstPause = ModConfig.GstPausePostStabilize;
-                                lastKnownMode = settledMode;
-                                DebugHelper.Flush();
-                                continue;
-                            }
-                        }
-                        else
-                        {
-                            continue;
-                        }
-                    }
-
-                    // Normal (non-stabilizing) path: full mode detection.
-                    GameStateTracker.Update();
-                    if (_shutdownRequested) break;
-
-                    // When behaviour pointer changed but no InputMode matched,
-                    // the game is in a scene transition (loading mission, etc.).
-                    // Pause ALL IL2CPP calls to avoid AV on freed native objects.
-                    if (GameStateTracker.NoModeMatched)
-                    {
-                        gstPause = ModConfig.GstPauseNoMode;
-                        noneLoadingCount = 0;
-                        if (postTactical || postTitle || noneProbeActive)
-                        {
-                            // In known menu states, behaviour pointer changes are normal
-                            // (sub-menu transitions, UI overlays). Use short cooldown
-                            // instead of NoneProbeThreshold (8s) which kills cursor tracking.
-                            searchCooldown = Math.Max(searchCooldown, ModConfig.PostStabilityCooldown / 2);
-                            DebugHelper.Write($"NoModeMatched in menu state, short cooldown={ModConfig.PostStabilityCooldown / 2}");
-                        }
-                        else
-                        {
-                            searchCooldown = Math.Max(searchCooldown, ModConfig.NoneProbeThreshold);
-                        }
-                        continue;
-                    }
-
-                    // If behaviour pointer changed but mode didn't, the game is
-                    // transitioning within the same mode (e.g. scene loading in NONE).
-                    if (GameStateTracker.BehaviourJustChanged)
-                        searchCooldown = Math.Max(searchCooldown, ModConfig.PostStabilityCooldown / 2);
-
-                    var currentMode = GameStateTracker.CurrentMode;
-                    if (currentMode != lastKnownMode)
-                    {
-                        HandleModeChange(currentMode, ref lastKnownMode, ref postTitle,
-                            ref postTactical, ref noneProbeActive, ref resultPending,
-                            ref resultTimeout);
-
-                        // Check for resultPending skip stabilize
-                        if (GameStateTracker.IsTacticalMode(currentMode) && resultPending)
-                        {
-                            DebugHelper.Write($"State change to {currentMode}, resultPending skip stabilize");
-                            lastKnownMode = currentMode;
-                            continue;
-                        }
-
-                        // Enter stabilizing mode
-                        stabilizing = true;
-                        stabilizeWait = 0;
-                        _screenReviewManager?.Clear();
-
-                        var fromMode = lastKnownMode;
-                        lastKnownMode = currentMode;
-
-                        // Brief GST pause to let scene transition begin
-                        if (lastKnownMode == InputManager.InputMode.BATTLE_SCENE)
-                            gstPause = ModConfig.GstPauseBattle;
-                        else if (lastKnownMode == InputManager.InputMode.ADVENTURE)
-                            gstPause = ModConfig.GstPauseAdventure;
-                        else if (fromMode == InputManager.InputMode.ADVENTURE)
-                            gstPause = ModConfig.GstPauseFromAdventure;
-                        else if (fromMode == InputManager.InputMode.BATTLE_SCENE
-                            || fromMode == InputManager.InputMode.NONE)
-                            gstPause = ModConfig.GstPauseFromBattleOrNone;
-                        else
-                            gstPause = postTactical ? ModConfig.GstPausePostTactical : ModConfig.GstPauseGeneric;
-                        DebugHelper.Flush();
-                        continue;
-                    }
-
-                    // Post-stabilization cooldown: skip FindObjectOfType
-                    // to let Unity finish loading objects before we search.
-                    bool searchAllowed = true;
-                    if (searchCooldown > 0)
-                    {
-                        searchCooldown--;
-                        searchAllowed = false;
-                    }
-
-                    // Skip handler updates during loading/splash states.
-                    // NONE is allowed when postTitle (main menu) or postTactical (tactical menus).
-                    bool isNoneLoading = currentMode == InputManager.InputMode.NONE
-                        && !postTitle && !postTactical;
-                    bool isLoadingState = currentMode == InputManager.InputMode.LOGO
-                        || currentMode == InputManager.InputMode.ENTRY
-                        || currentMode == InputManager.InputMode.TITLE
-                        || isNoneLoading;
-
-                    if (isNoneLoading)
-                    {
-                        noneLoadingCount++;
-                        // After save load, InputMode may stay NONE while the game
-                        // is actually running (e.g. during ADVENTURE loading sequence).
-                        // After timeout, probe to detect if we're in an active scene.
-                        if (searchAllowed && noneLoadingCount >= ModConfig.NoneProbeThreshold && noneLoadingCount % ModConfig.NoneProbeThreshold == 0)
-                        {
-                            if (GameStateTracker.BehaviourJustChanged)
-                            {
-                                DebugHelper.Write("NONE probe: behaviour pointer unstable, skipping");
-                                continue;
-                            }
-                            // Re-read GST to check for late mode changes
-                            GameStateTracker.Update();
-                            var probeMode = GameStateTracker.CurrentMode;
-                            if (probeMode != InputManager.InputMode.NONE)
-                            {
-                                DebugHelper.Write($"NONE probe: detected mode change to {probeMode}");
-                                // Let the next cycle handle the state change normally
-                                continue;
-                            }
-
-                            // Still NONE - check if there are active UI handlers
-                            // (meaning game is running despite NONE mode)
-                            try
-                            {
-                                var handlers = UnityEngine.Object.FindObjectsOfType<UIHandlerBase>();
-                                if (handlers != null && handlers.Count > 0)
-                                {
-                                    DebugHelper.Write($"NONE probe: found {handlers.Count} active UIHandlers, treating as active");
-                                    // Force into postTactical mode so handlers can run
-                                    postTactical = true;
-                                    noneProbeActive = true;
-                                    isLoadingState = false;
-                                    noneLoadingCount = 0;
-                                }
-                            }
-                            catch { }
-                        }
-                    }
-                    else
-                    {
-                        noneLoadingCount = 0;
-                    }
-
-                    if (isLoadingState) continue;
-
-                    bool isBattle = currentMode == InputManager.InputMode.BATTLE_SCENE;
-                    bool isAdventure = currentMode == InputManager.InputMode.ADVENTURE;
-
-                    if (isBattle)
-                    {
-                        // BATTLE_SCENE: subtitle handler only.
-                        // No menu searches during battle animation.
-                        // During search cooldown, skip all IL2CPP access (including subtitles).
-                        if (!searchAllowed) { /* cooldown active, skip */ }
-                        else
-                        {
-                            battlePoll++;
-                            if (battlePoll % 2 == 0)
-                            {
-                                GameStateTracker.Update();
-                                if (GameStateTracker.CurrentMode != InputManager.InputMode.BATTLE_SCENE)
-                                {
-                                    DebugHelper.Write("Battle poll: mode changed before handler, skipping");
-                                    continue;
-                                }
-                                // SAFETY: If behaviour pointer changed while still in BATTLE_SCENE,
-                                // the game is transitioning (battle ending, phase switch).
-                                // Skip FindObjectOfType during this unstable moment.
-                                if (GameStateTracker.BehaviourJustChanged)
-                                    continue;
-                                bool readStats = (battlePoll % 30 == 0);
-                                _battleSubtitleHandler?.Update(readStats);
-                            }
-                        }
-
-                    }
-                    else
-                    {
-                        // ALL non-battle states: universal menu reader + dialog
-                        battlePoll = 0;
-                        searchSlot = (searchSlot + 1) % ModConfig.TotalSearchSlots;
-
-                        // GenericMenuReader: auto-detects any active UIHandlerBase
-                        // Skip search during ADVENTURE - adventure uses dialogue system, not UIHandlerBase menus.
-                        // FindObjectsOfType during adventure→NONE transitions causes uncatchable AV crashes.
-                        bool canSearchMenu = searchAllowed && (searchSlot == 0) && !isAdventure;
-                        if (debugTraceCount < 5)
-                            DebugHelper.Write($"TRACE[{debugTraceCount}]: pre-menu mode={currentMode} search={canSearchMenu}");
-                        bool menuLost = _genericMenuReader?.Update(canSearchMenu) ?? false;
-                        if (debugTraceCount < 5)
-                            DebugHelper.Write($"TRACE[{debugTraceCount}]: post-menu menuLost={menuLost}");
-
-                        if (menuLost)
-                        {
-                            // If menu lost during postTitle NONE, the title scene
-                            // is being unloaded (e.g. save load). Clear postTitle
-                            // so NONE becomes a loading state (skip all handlers).
-                            if (currentMode == InputManager.InputMode.NONE)
-                            {
-                                if (postTitle)
-                                {
-                                    postTitle = false;
-                                    DebugHelper.Write("Menu handler lost in postTitle NONE: cleared postTitle (now loading)");
-                                }
-                                if (postTactical)
-                                {
-                                    postTactical = false;
-                                    noneProbeActive = false;
-                                    DebugHelper.Write("Menu handler lost in postTactical NONE: cleared postTactical (now loading)");
-                                }
-                            }
-                            stabilizing = true;
-    
-                            stabilizeWait = 0;
-    
-                            _screenReviewManager?.Clear();
-                            ReleaseUIHandlers();
-                            DebugHelper.Write("Menu handler lost, stabilizing");
-                            continue;
-                        }
-
-                        // Dialog handler runs in all non-battle states
-                        if (debugTraceCount < 5)
-                            DebugHelper.Write($"TRACE[{debugTraceCount}]: pre-dialog");
-                        _dialogHandler?.Update();
-                        if (debugTraceCount < 5)
-                            DebugHelper.Write($"TRACE[{debugTraceCount}]: post-dialog");
-
-                        if (isAdventure)
-                        {
-                            // Adventure: dialogue only. No FindObjectOfType searches for
-                            // tutorial/menus during adventure - reduces AV crash risk
-                            // during adventure→NONE scene transitions.
-                            _tutorialHandler?.Update(false);
-                            _adventureDialogueHandler?.Update(searchAllowed && searchSlot == 2);
-
-                            // When ADH detects dialogue ending (text empty), the adventure
-                            // scene is about to be destroyed. Preemptively pause ALL IL2CPP
-                            // access to prevent AV during the ~400ms window before InputMode
-                            // changes from ADVENTURE. Without this, GST.Update() calls
-                            // GetCurrentInputBehaviour() on freed native objects.
-                            if (_adventureDialogueHandler?.RefsJustReleased == true)
-                            {
-                                _adventureDialogueHandler.RefsJustReleased = false;
-                                DebugHelper.Write("ADH refs released: preemptive pause for scene transition");
-                                gstPause = ModConfig.GstPauseAdhRelease;
-                                stabilizing = true;
-        
-                                stabilizeWait = 0;
-        
-                                _screenReviewManager?.Clear();
-                                ReleaseUIHandlers();
-                                continue;
-                            }
-
-                            PollBattleResult(ref resultPoll, ref resultTimeout, ref resultPending);
-                        }
-                        else
-                        {
-                            // Tactical, strategy, postTitle, and all other states.
-                            // Skip tutorial FindObjectOfType during NONE probe mode -
-                            // no tutorial expected on result/info screens, and
-                            // FindObjectOfType is dangerous during NONE transitions.
-                            bool canSearchTutorial = searchAllowed && searchSlot == 1 && !noneProbeActive;
-                            _tutorialHandler?.Update(canSearchTutorial);
-                            PollBattleResult(ref resultPoll, ref resultTimeout, ref resultPending);
-
-                            // Tactical map cursor + unit cycling
-                            if (currentMode == InputManager.InputMode.TACTICAL_PART)
-                            {
-                                if (debugTraceCount < 5)
-                                    DebugHelper.Write($"TRACE[{debugTraceCount}]: pre-tactical");
-                                _tacticalMapHandler?.Update(searchAllowed && searchSlot == 2);
-                                if (debugTraceCount < 5)
-                                    DebugHelper.Write($"TRACE[{debugTraceCount}]: post-tactical");
-                            }
-                            else if (currentMode == InputManager.InputMode.TACTICAL_PART_BUTTON_UI
-                                || currentMode == InputManager.InputMode.TACTICAL_PART_WEAPON_LIST_SELECT_UI
-                                || currentMode == InputManager.InputMode.TACTICAL_PART_ROBOT_LIST_SELECT_UI
-                                || currentMode == InputManager.InputMode.TACTICAL_PART_READY_PAGE_BUTTON_UI)
-                                _tacticalMapHandler?.UpdateUnitOnly(searchAllowed && searchSlot == 2);
-                        }
-                    }
-
-                    if (debugTraceCount < 5)
-                    {
-                        DebugHelper.Write($"TRACE[{debugTraceCount}]: pre-review");
-                        debugTraceCount++;
-                    }
-
-                    // Universal screen review keys (R / [ / ])
-                    // Works in ALL non-loading states (battle, tactical, menus, adventure)
-                    CheckReviewKeys(ref lastKeyR, ref lastKeyLeft, ref lastKeyRight,
-                        currentMode, isBattle, isAdventure, postTactical);
-                }
-                catch (ThreadInterruptedException)
-                {
-                    break;
-                }
-                catch (Exception ex)
-                {
-                    if (_shutdownRequested) break;
-                    DebugHelper.Write($"Poll error: {ex.GetType().Name}: {ex.Message}");
-                    DebugHelper.Flush(); // Flush immediately for crash diagnostics
-                    stabilizing = true;  // re-stabilize after error
-                    stabilizeWait = 0;
-                    _screenReviewManager?.Clear();
-                    gstPause = ModConfig.GstPauseOnError;
-                    ReleaseUIHandlers();
-                    try { Thread.Sleep(2000); }
-                    catch (ThreadInterruptedException) { break; }
-                }
-            }
-
-            // Detach from IL2CPP domain before thread exits.
-            // Without this, the IL2CPP runtime may deadlock during teardown
-            // waiting for our thread, causing the game process to hang on exit.
+            // Phase 10: Detach from IL2CPP and exit init thread
             try
             {
                 var thread = IL2CPP.il2cpp_thread_current();
                 if (thread != IntPtr.Zero)
                 {
                     IL2CPP.il2cpp_thread_detach(thread);
-                    DebugHelper.Write("IL2CPP thread detached.");
+                    DebugHelper.Write("Init thread: IL2CPP detached. Thread exiting.");
                 }
             }
             catch { }
-
-            DebugHelper.Write("Poll loop exited (shutdown).");
         }
 
         /// <summary>
-        /// Release all UI handler references. Does NOT release GameStateTracker's
-        /// InputManager cache, since InputManager is a persistent singleton that
-        /// survives scene transitions.
+        /// Called every frame from Harmony postfix on InputManager.Update().
+        /// Runs on Unity main thread - all IL2CPP access is safe.
         /// </summary>
+        internal static void OnMainThreadUpdate()
+        {
+            if (!_initialized || _shutdownRequested) return;
+
+            _frameCount++;
+
+            // Check review keys every frame for instant response
+            CheckReviewKeys();
+
+            // Throttle handler updates to every PollFrameInterval frames (~100ms at 60fps)
+            if (_frameCount % ModConfig.PollFrameInterval != 0) return;
+
+            // Heartbeat
+            _heartbeat++;
+            if (_heartbeat % ModConfig.HeartbeatInterval == 0)
+            {
+                DebugHelper.Write($"Heartbeat #{_heartbeat / ModConfig.HeartbeatInterval}: mode={_lastKnownMode}, postTitle={_postTitle}, postTactical={_postTactical}, resultPending={_resultPending}");
+            }
+
+            // Update game state (safe on main thread)
+            GameStateTracker.Update();
+
+            // NoModeMatched: behaviour pointer changed but no InputMode recognized
+            if (GameStateTracker.NoModeMatched)
+            {
+                _noneLoadingCount = 0;
+                if (_postTactical || _postTitle || _noneProbeActive)
+                {
+                    _searchCooldown = Math.Max(_searchCooldown, 1);
+                    DebugHelper.Write("NoModeMatched in menu state, short cooldown");
+                }
+                else
+                {
+                    _searchCooldown = Math.Max(_searchCooldown, ModConfig.NoneProbeThreshold);
+                }
+                return;
+            }
+
+            // Behaviour pointer changed within same mode
+            if (GameStateTracker.BehaviourJustChanged)
+                _searchCooldown = Math.Max(_searchCooldown, 1);
+
+            var currentMode = GameStateTracker.CurrentMode;
+
+            // Mode change
+            if (currentMode != _lastKnownMode)
+            {
+                DebugHelper.Write($"GameState: {_lastKnownMode} -> {currentMode}");
+                HandleModeChange(currentMode);
+
+                // Special case: resultPending + tactical = skip cooldown for result detection
+                if (GameStateTracker.IsTacticalMode(currentMode) && _resultPending)
+                {
+                    _lastKnownMode = currentMode;
+                    _searchCooldown = ModConfig.SearchCooldownAfterChange;
+                    // Don't return - let handlers run for result polling
+                }
+                else
+                {
+                    _lastKnownMode = currentMode;
+                    _searchCooldown = ModConfig.SearchCooldownAfterChange;
+                    _screenReviewManager?.Clear();
+                    return; // Let scene settle
+                }
+            }
+
+            // Search cooldown
+            bool searchAllowed = true;
+            if (_searchCooldown > 0)
+            {
+                _searchCooldown--;
+                searchAllowed = false;
+            }
+
+            // Loading state detection
+            bool isNoneLoading = currentMode == InputManager.InputMode.NONE
+                && !_postTitle && !_postTactical;
+            bool isLoadingState = currentMode == InputManager.InputMode.LOGO
+                || currentMode == InputManager.InputMode.ENTRY
+                || currentMode == InputManager.InputMode.TITLE
+                || isNoneLoading;
+
+            if (isNoneLoading)
+            {
+                _noneLoadingCount++;
+                // NONE probe: detect if game is running despite NONE mode
+                if (searchAllowed && _noneLoadingCount >= ModConfig.NoneProbeThreshold
+                    && _noneLoadingCount % ModConfig.NoneProbeThreshold == 0)
+                {
+                    if (GameStateTracker.BehaviourJustChanged)
+                    {
+                        DebugHelper.Write("NONE probe: behaviour pointer unstable, skipping");
+                        return;
+                    }
+                    // Re-read GST to check for late mode changes
+                    GameStateTracker.Update();
+                    var probeMode = GameStateTracker.CurrentMode;
+                    if (probeMode != InputManager.InputMode.NONE)
+                    {
+                        DebugHelper.Write($"NONE probe: detected mode change to {probeMode}");
+                        return;
+                    }
+
+                    // Still NONE - check for active UI handlers
+                    try
+                    {
+                        var handlers = UnityEngine.Object.FindObjectsOfType<UIHandlerBase>();
+                        if (handlers != null && handlers.Count > 0)
+                        {
+                            DebugHelper.Write($"NONE probe: found {handlers.Count} active UIHandlers, treating as active");
+                            _postTactical = true;
+                            _noneProbeActive = true;
+                            isLoadingState = false;
+                            _noneLoadingCount = 0;
+                        }
+                    }
+                    catch { }
+                }
+            }
+            else
+            {
+                _noneLoadingCount = 0;
+            }
+
+            if (isLoadingState) return;
+
+            // ===== Handler updates =====
+            bool isBattle = currentMode == InputManager.InputMode.BATTLE_SCENE;
+            bool isAdventure = currentMode == InputManager.InputMode.ADVENTURE;
+            _searchSlot = (_searchSlot + 1) % ModConfig.TotalSearchSlots;
+
+            if (isBattle)
+            {
+                _battlePoll++;
+                if (_battlePoll % 2 == 0)
+                {
+                    // Re-check mode (battle can end mid-frame sequence)
+                    GameStateTracker.Update();
+                    if (GameStateTracker.CurrentMode != InputManager.InputMode.BATTLE_SCENE)
+                        return;
+                    if (GameStateTracker.BehaviourJustChanged)
+                        return;
+                    bool readStats = (_battlePoll % 30 == 0);
+                    _battleSubtitleHandler?.Update(readStats);
+                }
+            }
+            else
+            {
+                _battlePoll = 0;
+
+                // GenericMenuReader
+                bool canSearchMenu = searchAllowed && (_searchSlot == 0) && !isAdventure;
+                bool menuLost = _genericMenuReader?.Update(canSearchMenu) ?? false;
+
+                if (menuLost)
+                {
+                    if (currentMode == InputManager.InputMode.NONE)
+                    {
+                        if (_postTitle)
+                        {
+                            _postTitle = false;
+                            DebugHelper.Write("Menu lost in postTitle NONE: cleared");
+                        }
+                        if (_postTactical)
+                        {
+                            _postTactical = false;
+                            _noneProbeActive = false;
+                            DebugHelper.Write("Menu lost in postTactical NONE: cleared");
+                        }
+                    }
+                    _searchCooldown = ModConfig.SearchCooldownAfterChange;
+                    _screenReviewManager?.Clear();
+                    ReleaseUIHandlers();
+                    return;
+                }
+
+                // Dialog handler
+                _dialogHandler?.Update();
+
+                if (isAdventure)
+                {
+                    _tutorialHandler?.Update(false);
+                    _adventureDialogueHandler?.Update(searchAllowed && _searchSlot == 2);
+
+                    if (_adventureDialogueHandler?.RefsJustReleased == true)
+                    {
+                        _adventureDialogueHandler.RefsJustReleased = false;
+                        DebugHelper.Write("ADH refs released: cooldown for scene transition");
+                        _searchCooldown = ModConfig.SearchCooldownAfterChange;
+                        _screenReviewManager?.Clear();
+                        ReleaseUIHandlers();
+                        return;
+                    }
+
+                    PollBattleResult();
+                }
+                else
+                {
+                    bool canSearchTutorial = searchAllowed && _searchSlot == 1 && !_noneProbeActive;
+                    _tutorialHandler?.Update(canSearchTutorial);
+                    PollBattleResult();
+
+                    if (currentMode == InputManager.InputMode.TACTICAL_PART)
+                    {
+                        _tacticalMapHandler?.Update(searchAllowed && _searchSlot == 2);
+                    }
+                    else if (currentMode == InputManager.InputMode.TACTICAL_PART_BUTTON_UI
+                        || currentMode == InputManager.InputMode.TACTICAL_PART_WEAPON_LIST_SELECT_UI
+                        || currentMode == InputManager.InputMode.TACTICAL_PART_ROBOT_LIST_SELECT_UI
+                        || currentMode == InputManager.InputMode.TACTICAL_PART_READY_PAGE_BUTTON_UI)
+                    {
+                        _tacticalMapHandler?.UpdateUnitOnly(searchAllowed && _searchSlot == 2);
+                    }
+                }
+            }
+        }
+
+        private static void HandleModeChange(InputManager.InputMode newMode)
+        {
+            if (_lastKnownMode == InputManager.InputMode.TITLE
+                && newMode == InputManager.InputMode.NONE)
+            {
+                _postTitle = true;
+                ReleaseUIHandlers();
+                DebugHelper.Write("TITLE -> NONE: post-title mode");
+            }
+            else if (_lastKnownMode == InputManager.InputMode.BATTLE_SCENE
+                && newMode == InputManager.InputMode.NONE)
+            {
+                _resultPending = true;
+                _resultTimeout = 0;
+                ReleaseUIHandlers(keepResultHandler: true);
+                DebugHelper.Write("BATTLE_SCENE -> NONE: resultPending set");
+            }
+            else
+            {
+                bool lastWasTactical = GameStateTracker.IsTacticalMode(_lastKnownMode);
+                bool isTacticalSub = GameStateTracker.IsTacticalMode(newMode);
+
+                if (newMode != InputManager.InputMode.NONE)
+                {
+                    _postTitle = false;
+                    _noneProbeActive = false;
+                    if (!isTacticalSub)
+                        _postTactical = false;
+                }
+
+                if (lastWasTactical && newMode == InputManager.InputMode.NONE)
+                {
+                    _postTactical = true;
+                    _noneProbeActive = false;
+                    ReleaseUIHandlers();
+                    DebugHelper.Write("Tactical -> NONE: postTactical mode");
+                }
+                else if (_resultPending && isTacticalSub)
+                {
+                    // Handled by caller (resultPending skip)
+                }
+                else
+                {
+                    if (newMode == InputManager.InputMode.BATTLE_SCENE)
+                    {
+                        if (_resultPending)
+                        {
+                            _resultPending = false;
+                            DebugHelper.Write("resultPending cleared (new battle)");
+                        }
+                    }
+                    else if (newMode == InputManager.InputMode.ADVENTURE)
+                    {
+                        if (_resultPending)
+                        {
+                            _resultPending = false;
+                            DebugHelper.Write("resultPending cleared (adventure)");
+                        }
+                    }
+
+                    if (!lastWasTactical || newMode != InputManager.InputMode.NONE)
+                        ReleaseUIHandlers();
+                }
+
+                DebugHelper.Write($"State change to {newMode}");
+            }
+        }
+
         private static void ReleaseUIHandlers(bool keepResultHandler = false)
         {
             _genericMenuReader?.ReleaseHandler();
@@ -867,132 +690,67 @@ namespace SRWYAccess
                 _battleResultHandler?.ReleaseHandler();
         }
 
-        /// <summary>
-        /// Handle a detected mode change: update flags, release handlers.
-        /// Extracted so both normal path and post-stabilize path share logic.
-        /// Does NOT set stabilizing/gstPause (caller decides).
-        /// </summary>
-        private static void HandleModeChange(
-            InputManager.InputMode newMode,
-            ref InputManager.InputMode lastKnownMode,
-            ref bool postTitle, ref bool postTactical,
-            ref bool noneProbeActive, ref bool resultPending,
-            ref int resultTimeout)
+        private static void PollBattleResult()
         {
-            if (lastKnownMode == InputManager.InputMode.TITLE
-                && newMode == InputManager.InputMode.NONE)
+            if (_battleResultHandler == null || !_resultPending) return;
+
+            _resultTimeout++;
+            if (_resultTimeout > ModConfig.ResultTimeout)
             {
-                postTitle = true;
-                ReleaseUIHandlers();
-                DebugHelper.Write("TITLE -> NONE: post-title mode, stabilizing");
-            }
-            else if (lastKnownMode == InputManager.InputMode.BATTLE_SCENE
-                && newMode == InputManager.InputMode.NONE)
-            {
-                resultPending = true;
-                resultTimeout = 0;
-                ReleaseUIHandlers(keepResultHandler: true);
-                DebugHelper.Write("BATTLE_SCENE -> NONE: resultPending set, stabilizing (kept result handler)");
-            }
-            else
-            {
-                bool lastWasTactical = GameStateTracker.IsTacticalMode(lastKnownMode);
-                bool isTacticalSub = GameStateTracker.IsTacticalMode(newMode);
-
-                if (newMode != InputManager.InputMode.NONE)
-                {
-                    postTitle = false;
-                    noneProbeActive = false;
-                    if (!isTacticalSub)
-                        postTactical = false;
-                }
-
-                if (lastWasTactical && newMode == InputManager.InputMode.NONE)
-                {
-                    postTactical = true;
-                    noneProbeActive = false;
-                    ReleaseUIHandlers();
-                    DebugHelper.Write("Tactical -> NONE: postTactical mode, stabilizing");
-                }
-                else if (resultPending && isTacticalSub)
-                {
-                    // Handled by caller (resultPending skip stabilize)
-                }
-                else
-                {
-                    if (newMode == InputManager.InputMode.BATTLE_SCENE)
-                    {
-                        if (resultPending)
-                        {
-                            resultPending = false;
-                            DebugHelper.Write("resultPending cleared (new battle)");
-                        }
-                    }
-                    else if (newMode == InputManager.InputMode.ADVENTURE)
-                    {
-                        if (resultPending)
-                        {
-                            resultPending = false;
-                            DebugHelper.Write("resultPending cleared (adventure)");
-                        }
-                    }
-
-                    if (!lastWasTactical || newMode != InputManager.InputMode.NONE)
-                        ReleaseUIHandlers();
-                }
-
-                DebugHelper.Write($"State change to {newMode}, stabilizing");
-            }
-        }
-
-        /// <summary>
-        /// Poll battle result handler with rate-limiting.
-        /// Only polls when resultPending (after BATTLE_SCENE → NONE transition).
-        /// Uses GameManager singleton chain internally (no FindObjectOfType).
-        /// </summary>
-        private static void PollBattleResult(ref int resultPoll, ref int resultTimeout, ref bool resultPending)
-        {
-            if (_battleResultHandler == null || !resultPending) return;
-
-            resultTimeout++;
-            if (resultTimeout > ModConfig.ResultTimeout)
-            {
-                resultPending = false;
+                _resultPending = false;
                 DebugHelper.Write("resultPending timeout, clearing");
                 return;
             }
-            resultPoll++;
-            if (resultPoll % 2 == 0)
+            _resultPoll++;
+            if (_resultPoll % 2 == 0)
                 _battleResultHandler.Update();
         }
 
-        /// <summary>
-        /// Check R/[/] keys for universal screen review.
-        /// R: read all screen info, [: browse prev, ]: browse next.
-        /// Works in ALL non-loading states.
-        /// </summary>
-        private static void CheckReviewKeys(
-            ref bool lastKeyR, ref bool lastKeyLeft, ref bool lastKeyRight,
-            InputManager.InputMode currentMode, bool isBattle, bool isAdventure, bool postTactical)
+        private static void CheckReviewKeys()
         {
             if (_screenReviewManager == null) return;
+
+            var currentMode = GameStateTracker.CurrentMode;
+            bool isBattle = currentMode == InputManager.InputMode.BATTLE_SCENE;
+            bool isAdventure = currentMode == InputManager.InputMode.ADVENTURE;
 
             bool keyR = (GetAsyncKeyState(VK_R) & 0x8000) != 0;
             bool keyLeft = (GetAsyncKeyState(VK_OEM_4) & 0x8000) != 0;
             bool keyRight = (GetAsyncKeyState(VK_OEM_6) & 0x8000) != 0;
 
-            if (keyR && !lastKeyR)
-                _screenReviewManager.ReadAll(currentMode, isBattle, isAdventure, postTactical);
+            if (keyR && !_lastKeyR)
+                _screenReviewManager.ReadAll(currentMode, isBattle, isAdventure, _postTactical);
 
-            if (keyLeft && !lastKeyLeft)
-                _screenReviewManager.BrowsePrev(currentMode, isBattle, isAdventure, postTactical);
+            if (keyLeft && !_lastKeyLeft)
+                _screenReviewManager.BrowsePrev(currentMode, isBattle, isAdventure, _postTactical);
 
-            if (keyRight && !lastKeyRight)
-                _screenReviewManager.BrowseNext(currentMode, isBattle, isAdventure, postTactical);
+            if (keyRight && !_lastKeyRight)
+                _screenReviewManager.BrowseNext(currentMode, isBattle, isAdventure, _postTactical);
 
-            lastKeyR = keyR;
-            lastKeyLeft = keyLeft;
-            lastKeyRight = keyRight;
+            _lastKeyR = keyR;
+            _lastKeyLeft = keyLeft;
+            _lastKeyRight = keyRight;
+        }
+    }
+
+    /// <summary>
+    /// Harmony patch: injects mod update into InputManager.Update() on the Unity main thread.
+    /// InputManager is a persistent SingletonMonoBehaviour that runs every frame.
+    /// </summary>
+    [HarmonyPatch(typeof(InputManager), "Update")]
+    internal static class InputManagerUpdatePatch
+    {
+        static void Postfix()
+        {
+            try
+            {
+                ModCore.OnMainThreadUpdate();
+            }
+            catch (Exception ex)
+            {
+                DebugHelper.Write($"Main thread update error: {ex.GetType().Name}: {ex.Message}");
+                DebugHelper.Flush();
+            }
         }
     }
 }
