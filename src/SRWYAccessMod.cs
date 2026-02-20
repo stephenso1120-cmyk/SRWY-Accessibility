@@ -594,7 +594,7 @@ namespace SRWYAccess
             // Phase 9: Activate main thread updates
             _initialized = true;
             ScreenReaderOutput.Say(Loc.Get("mod_loaded"));
-            DebugHelper.Write("Fully initialized. Main thread updates active.");
+            DebugHelper.Write($"Fully initialized. Lang={Loc.CurrentLang}. Main thread updates active.");
             DebugHelper.Flush();
 
             // Phase 10: Detach from IL2CPP and exit init thread
@@ -635,6 +635,9 @@ namespace SRWYAccess
             // Don't reset _breadcrumb here: heartbeat logs the PREVIOUS poll's final stage.
             // On crash, the last heartbeat breadcrumb reveals what completed before the crash.
             _frameCount++;
+
+            // Re-check language until SaveLoadManager data is available
+            Loc.TryConfirmLanguage();
 
             // Safe mode: only handle basic functionality
             if (_safeMode)

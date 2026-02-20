@@ -1,7 +1,9 @@
 using System;
 using System.Collections.Generic;
 using System.Globalization;
+using Il2CppCom.BBStudio.SRTeam.Common;
 using Il2CppCom.BBStudio.SRTeam.Manager;
+using Il2CppCosmos;
 
 namespace SRWYAccess
 {
@@ -14,6 +16,10 @@ namespace SRWYAccess
     {
         private static bool _initialized;
         private static string _currentLang = "en";
+        private static int _recheckCounter; // throttle: only re-check every N frames
+
+        /// <summary>Current language code for diagnostics.</summary>
+        public static string CurrentLang => _currentLang;
 
         // One dictionary per supported language
         private static readonly Dictionary<string, string> _zhCN = new();
@@ -33,39 +39,70 @@ namespace SRWYAccess
         }
 
         /// <summary>
-        /// Re-detect language. Prioritizes Windows system locale, falls back to
-        /// game locale if system locale maps to English (may indicate unlocalized OS).
+        /// Call from main loop. Periodically re-checks language from game managers.
+        /// The game may change locale after mod init (e.g. loading save data),
+        /// so we keep polling every ~1 second.
+        /// </summary>
+        public static void TryConfirmLanguage()
+        {
+            _recheckCounter++;
+            if (_recheckCounter < 60) return; // ~1 second at 60fps
+            _recheckCounter = 0;
+            RefreshLanguage();
+        }
+
+        /// <summary>
+        /// Re-detect language. LocalizationManager is the primary source (tracks
+        /// the user's chosen display language). KpiManager is the fallback (tracks
+        /// game SKU/region, which may differ from display language).
         /// </summary>
         public static void RefreshLanguage()
         {
-            string systemLocale = GetSystemLocale();
-            string gameLocale = GetGameLocale();
+            // Source 1: LocalizationManager.GetLocaleID() — tracks actual display language
+            string lang = GetLocalizationManagerLanguage();
 
-            DebugHelper.Write($"Loc: system locale={systemLocale}, game locale={gameLocale}");
+            // Source 2: KpiManager.gameLanguage — fallback (SKU/region language)
+            if (lang == null)
+                lang = GetKpiManagerLanguage();
 
-            // Use system locale as primary source
-            string lang = MapLocaleToLang(systemLocale);
-
-            // If system locale mapped to English but game is in a CJK language,
-            // prefer the game locale (user likely set game language deliberately)
-            if (lang == "en" && !string.IsNullOrEmpty(gameLocale))
+            if (lang != null)
             {
-                string gameLang = MapLocaleToLang(gameLocale);
-                if (gameLang != "en")
+                if (lang != _currentLang)
                 {
-                    lang = gameLang;
-                    DebugHelper.Write($"Loc: system=en but game={gameLang}, using game locale");
+                    DebugHelper.Write($"Loc: language changed {_currentLang} → {lang}");
+                    _currentLang = lang;
                 }
             }
-
-            _currentLang = lang;
-            DebugHelper.Write($"Loc: selected language={_currentLang}");
+            else
+            {
+                // Game managers not available yet — use system locale as temporary default
+                string systemLocale = GetSystemLocale();
+                string sysLang = MapLocaleToLang(systemLocale);
+                if (sysLang != _currentLang)
+                {
+                    _currentLang = sysLang;
+                    DebugHelper.Write($"Loc: game data not ready, temporary system locale → {_currentLang}");
+                }
+            }
         }
 
         private static string MapLocaleToLang(string locale)
         {
             if (string.IsNullOrEmpty(locale)) return "en";
 
+            // GameLanguage enum names from SaveLoadManager
+            if (locale.Equals("SimpleChinese", StringComparison.OrdinalIgnoreCase))
+                return "zh_CN";
+            if (locale.Equals("TraditionalChinese", StringComparison.OrdinalIgnoreCase))
+                return "zh_TW";
+            if (locale.Equals("Japanese", StringComparison.OrdinalIgnoreCase))
+                return "ja";
+            if (locale.Equals("Korean", StringComparison.OrdinalIgnoreCase))
+                return "ko";
+            if (locale.Equals("English", StringComparison.OrdinalIgnoreCase))
+                return "en";
+
+            // Standard locale codes (fallback for system locale / Unity SelectedLocale)
             if (locale.StartsWith("zh_CN", StringComparison.OrdinalIgnoreCase)
                 || locale.StartsWith("zh-CN", StringComparison.OrdinalIgnoreCase)
                 || locale.StartsWith("zh-Hans", StringComparison.OrdinalIgnoreCase))
@@ -134,19 +171,67 @@ namespace SRWYAccess
             }
         }
 
-        private static string GetGameLocale()
+        /// <summary>
+        /// Try KpiManager.gameLanguage — returns lang code or null.
+        /// </summary>
+        private static string GetKpiManagerLanguage()
         {
             try
             {
-                var locMgr = LocalizationManager.instance;
-                if ((object)locMgr != null)
+                var kpi = KpiManager.instance;
+                if ((object)kpi == null) return null;
+
+                var lang = kpi.gameLanguage;
+                string result;
+                switch (lang)
                 {
-                    var localeId = locMgr.GetLocaleID();
-                    return localeId.ToString();
+                    case GameLanguage.English: result = "en"; break;
+                    case GameLanguage.SimpleChinese: result = "zh_CN"; break;
+                    case GameLanguage.TraditionalChinese: result = "zh_TW"; break;
+                    case GameLanguage.Japanese: result = "ja"; break;
+                    case GameLanguage.Korean: result = "ko"; break;
+                    default: result = "en"; break;
                 }
+                DebugHelper.Write($"Loc: KpiManager.gameLanguage={lang} → {result}");
+                return result;
             }
-            catch { }
-            return "en_US";
+            catch (Exception ex)
+            {
+                DebugHelper.Write($"Loc: KpiManager failed: {ex.Message}");
+                return null;
+            }
+        }
+
+        /// <summary>
+        /// Try LocalizationManager.GetLocaleID() — returns lang code or null.
+        /// </summary>
+        private static string GetLocalizationManagerLanguage()
+        {
+            try
+            {
+                var lm = LocalizationManager.instance;
+                if ((object)lm == null) return null;
+
+                var localeId = lm.GetLocaleID();
+                string result;
+                switch (localeId)
+                {
+                    case LocalizationManager.LocaleID.en_US: result = "en"; break;
+                    case LocalizationManager.LocaleID.zh_CN: result = "zh_CN"; break;
+                    case LocalizationManager.LocaleID.zh_TW: result = "zh_TW"; break;
+                    case LocalizationManager.LocaleID.zh_HK: result = "zh_TW"; break;
+                    case LocalizationManager.LocaleID.ja_JP: result = "ja"; break;
+                    case LocalizationManager.LocaleID.ko_KR: result = "ko"; break;
+                    default: result = "en"; break;
+                }
+                DebugHelper.Write($"Loc: LocalizationManager.GetLocaleID()={localeId} → {result}");
+                return result;
+            }
+            catch (Exception ex)
+            {
+                DebugHelper.Write($"Loc: LocalizationManager failed: {ex.Message}");
+                return null;
+            }
         }
 
         private static Dictionary<string, string> GetCurrentDictionary()
