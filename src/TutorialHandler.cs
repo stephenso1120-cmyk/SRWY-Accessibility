@@ -3,6 +3,7 @@ using MelonLoader;
 using UnityEngine;
 using Il2CppCom.BBStudio.SRTeam.Tutorial;
 using Il2CppCom.BBStudio.SRTeam.UIs;
+using Il2CppInterop.Runtime;
 
 namespace SRWYAccess
 {
@@ -138,6 +139,13 @@ namespace SRWYAccess
             var handler = GetUIHandler(tutMgr);
             if ((object)handler == null) return;
 
+            // SAFETY: ProbeObject before accessing handler properties to prevent AV
+            if (!SafeCall.ProbeObject(handler.Pointer))
+            {
+                DebugHelper.Write("TutorialHandler: ProbeObject failed for handler in TrackPageChange");
+                return;
+            }
+
             string currentPage = "";
             try
             {
@@ -151,7 +159,16 @@ namespace SRWYAccess
                         var pageTextComp = win.pageText;
                         if ((object)pageTextComp != null)
                         {
-                            currentPage = pageTextComp.text ?? "";
+                            // CRITICAL: Use SafeCall to read tmp.text - direct access causes
+                            // uncatchable AccessViolationException when TMP destroyed
+                            if (SafeCall.TmpTextMethodAvailable)
+                            {
+                                IntPtr il2cppStrPtr = SafeCall.ReadTmpTextSafe(pageTextComp.Pointer);
+                                if (il2cppStrPtr != IntPtr.Zero)
+                                {
+                                    try { currentPage = IL2CPP.Il2CppStringToManaged(il2cppStrPtr) ?? ""; } catch { }
+                                }
+                            }
                             break;
                         }
                     }
@@ -189,6 +206,13 @@ namespace SRWYAccess
         {
             var handler = GetUIHandler(tutMgr);
             if ((object)handler == null) return;
+
+            // SAFETY: ProbeObject before accessing handler properties to prevent AV
+            if (!SafeCall.ProbeObject(handler.Pointer))
+            {
+                DebugHelper.Write("TutorialHandler: ProbeObject failed for handler in TrackButtonNavigation");
+                return;
+            }
 
             try
             {
@@ -230,6 +254,12 @@ namespace SRWYAccess
 
         private string ReadTitle(TutorialUIHandler handler)
         {
+            // SAFETY: ProbeObject before accessing handler properties to prevent AV
+            if (!SafeCall.ProbeObject(handler.Pointer))
+            {
+                return _lastTitle;
+            }
+
             try
             {
                 var windows = handler.windows;
@@ -242,7 +272,17 @@ namespace SRWYAccess
                         var titleComp = win.titleText;
                         if ((object)titleComp != null)
                         {
-                            string text = titleComp.text;
+                            // CRITICAL: Use SafeCall to read tmp.text - direct access causes
+                            // uncatchable AccessViolationException when TMP destroyed
+                            string text = null;
+                            if (SafeCall.TmpTextMethodAvailable)
+                            {
+                                IntPtr il2cppStrPtr = SafeCall.ReadTmpTextSafe(titleComp.Pointer);
+                                if (il2cppStrPtr != IntPtr.Zero)
+                                {
+                                    try { text = IL2CPP.Il2CppStringToManaged(il2cppStrPtr); } catch { }
+                                }
+                            }
                             if (!string.IsNullOrEmpty(text))
                             {
                                 _lastTitle = TextUtils.CleanRichText(text);
@@ -262,6 +302,12 @@ namespace SRWYAccess
 
         private string ReadInfoText(TutorialUIHandler handler)
         {
+            // SAFETY: ProbeObject before accessing handler properties to prevent AV
+            if (!SafeCall.ProbeObject(handler.Pointer))
+            {
+                return _lastInfoText;
+            }
+
             // First try the cached currentInfoText property
             try
             {
@@ -287,7 +333,17 @@ namespace SRWYAccess
                         var infoComp = win.infoText;
                         if ((object)infoComp != null)
                         {
-                            string text = infoComp.text;
+                            // CRITICAL: Use SafeCall to read tmp.text - direct access causes
+                            // uncatchable AccessViolationException when TMP destroyed
+                            string text = null;
+                            if (SafeCall.TmpTextMethodAvailable)
+                            {
+                                IntPtr il2cppStrPtr = SafeCall.ReadTmpTextSafe(infoComp.Pointer);
+                                if (il2cppStrPtr != IntPtr.Zero)
+                                {
+                                    try { text = IL2CPP.Il2CppStringToManaged(il2cppStrPtr); } catch { }
+                                }
+                            }
                             if (!string.IsNullOrEmpty(text))
                             {
                                 _lastInfoText = TextUtils.CleanRichText(text);
@@ -307,6 +363,12 @@ namespace SRWYAccess
 
         private string ReadPageInfo(TutorialUIHandler handler)
         {
+            // SAFETY: ProbeObject before accessing handler properties to prevent AV
+            if (!SafeCall.ProbeObject(handler.Pointer))
+            {
+                return ""; // No cached value for page info
+            }
+
             string page = "";
             string total = "";
 
@@ -323,8 +385,24 @@ namespace SRWYAccess
                         var pageComp = win.pageText;
                         var totalComp = win.totalPageText;
 
-                        if ((object)pageComp != null) page = pageComp.text ?? "";
-                        if ((object)totalComp != null) total = totalComp.text ?? "";
+                        // CRITICAL: Use SafeCall to read tmp.text - direct access causes
+                        // uncatchable AccessViolationException when TMP destroyed
+                        if ((object)pageComp != null && SafeCall.TmpTextMethodAvailable)
+                        {
+                            IntPtr strPtr = SafeCall.ReadTmpTextSafe(pageComp.Pointer);
+                            if (strPtr != IntPtr.Zero)
+                            {
+                                try { page = IL2CPP.Il2CppStringToManaged(strPtr) ?? ""; } catch { }
+                            }
+                        }
+                        if ((object)totalComp != null && SafeCall.TmpTextMethodAvailable)
+                        {
+                            IntPtr strPtr = SafeCall.ReadTmpTextSafe(totalComp.Pointer);
+                            if (strPtr != IntPtr.Zero)
+                            {
+                                try { total = IL2CPP.Il2CppStringToManaged(strPtr) ?? ""; } catch { }
+                            }
+                        }
 
                         if (!string.IsNullOrEmpty(page)) break;
                     }

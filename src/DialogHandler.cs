@@ -2,6 +2,7 @@ using System;
 using MelonLoader;
 using UnityEngine;
 using Il2CppCom.BBStudio.SRTeam.UIs;
+using Il2CppInterop.Runtime;
 using Il2CppInterop.Runtime.InteropTypes.Arrays;
 using Il2CppTMPro;
 
@@ -227,10 +228,29 @@ namespace SRWYAccess
                     return null;
                 }
 
+                // SAFETY: ProbeObject before accessing .dialogPrefabObject to prevent AV
+                // on partially-destroyed DialogSystem during scene transitions.
+                if (!SafeCall.ProbeObject(_dialog.Pointer))
+                {
+                    DebugHelper.Write("DialogHandler: ProbeObject failed for DialogSystem");
+                    _dialog = null;
+                    return null;
+                }
+
                 var prefab = _dialog.dialogPrefabObject;
                 if ((object)prefab == null || prefab.Pointer == IntPtr.Zero) return null;
 
-                var tmps = prefab.GetComponentsInChildren<TextMeshProUGUI>(false);
+                // CRITICAL: Inner try-catch for GetComponentsInChildren
+                Il2CppInterop.Runtime.InteropTypes.Arrays.Il2CppArrayBase<TextMeshProUGUI> tmps = null;
+                try
+                {
+                    tmps = prefab.GetComponentsInChildren<TextMeshProUGUI>(false);
+                }
+                catch (Exception ex)
+                {
+                    DebugHelper.Write($"DialogHandler: GetComponentsInChildren error: {ex.GetType().Name}");
+                    return null;
+                }
                 if (tmps == null || tmps.Count == 0) return null;
 
                 string bestText = null;
@@ -239,7 +259,22 @@ namespace SRWYAccess
                     if ((object)tmp == null) continue;
                     try
                     {
-                        string t = TextUtils.CleanRichText(tmp.text);
+                        // CRITICAL: Use SafeCall to read tmp.text - direct access causes
+                        // uncatchable AccessViolationException when TMP destroyed
+                        string t = null;
+                        if (SafeCall.TmpTextMethodAvailable)
+                        {
+                            IntPtr il2cppStrPtr = SafeCall.ReadTmpTextSafe(tmp.Pointer);
+                            if (il2cppStrPtr != IntPtr.Zero)
+                            {
+                                try
+                                {
+                                    t = IL2CPP.Il2CppStringToManaged(il2cppStrPtr);
+                                    t = TextUtils.CleanRichText(t);
+                                }
+                                catch { }
+                            }
+                        }
                         if (!string.IsNullOrWhiteSpace(t) && !_dialogTitleLabels.Contains(t.Trim()))
                         {
                             if (bestText == null || t.Length > bestText.Length)
@@ -380,9 +415,24 @@ namespace SRWYAccess
                 var tmpText = button.GetComponentInChildren<TextMeshProUGUI>();
                 if ((object)tmpText != null)
                 {
-                    string text = tmpText.text;
+                    // CRITICAL: Use SafeCall to read tmp.text - direct access causes
+                    // uncatchable AccessViolationException when TMP destroyed
+                    string text = null;
+                    if (SafeCall.TmpTextMethodAvailable)
+                    {
+                        IntPtr il2cppStrPtr = SafeCall.ReadTmpTextSafe(tmpText.Pointer);
+                        if (il2cppStrPtr != IntPtr.Zero)
+                        {
+                            try
+                            {
+                                text = IL2CPP.Il2CppStringToManaged(il2cppStrPtr);
+                                text = TextUtils.CleanRichText(text);
+                            }
+                            catch { }
+                        }
+                    }
                     if (!string.IsNullOrEmpty(text))
-                        return TextUtils.CleanRichText(text);
+                        return text;
                 }
             }
             catch (Exception ex)

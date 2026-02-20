@@ -30,6 +30,26 @@
     </Reference>
   </ItemGroup>
 
+  <!-- MonoMod (for NativeDetour inline hooking) -->
+  <ItemGroup>
+    <Reference Include="MonoMod.RuntimeDetour">
+      <HintPath>C:\Program Files (x86)\Steam\steamapps\common\SRWY\MelonLoader\net6\MonoMod.RuntimeDetour.dll</HintPath>
+      <Private>false</Private>
+    </Reference>
+    <Reference Include="MonoMod.Utils">
+      <HintPath>C:\Program Files (x86)\Steam\steamapps\common\SRWY\MelonLoader\net6\MonoMod.Utils.dll</HintPath>
+      <Private>false</Private>
+    </Reference>
+    <Reference Include="MonoMod.Backports">
+      <HintPath>C:\Program Files (x86)\Steam\steamapps\common\SRWY\MelonLoader\net6\MonoMod.Backports.dll</HintPath>
+      <Private>false</Private>
+    </Reference>
+    <Reference Include="MonoMod.ILHelpers">
+      <HintPath>C:\Program Files (x86)\Steam\steamapps\common\SRWY\MelonLoader\net6\MonoMod.ILHelpers.dll</HintPath>
+      <Private>false</Private>
+    </Reference>
+  </ItemGroup>
+
   <!-- Il2Cpp Game Assemblies -->
   <ItemGroup>
     <Reference Include="Assembly-CSharp">

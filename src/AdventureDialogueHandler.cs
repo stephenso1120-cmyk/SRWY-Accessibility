@@ -3,6 +3,7 @@ using UnityEngine;
 using Il2CppAdvSDemoDlgEv;
 using Il2CppCom.BBStudio.SRTeam.Common;
 using Il2CppCom.BBStudio.SRTeam.UIs;
+using Il2CppInterop.Runtime;
 
 namespace SRWYAccess
 {
@@ -26,7 +27,11 @@ namespace SRWYAccess
 
         private string _lastDialogueText = "";
         private string _lastSpeakerName = "";
-        private int _findCycle = 0;
+        // Track the IL2CPP string pointer (not just content) to detect
+        // same-text dialogue entries. When a character says the same line
+        // consecutively, the game allocates a new IL2CPP string object
+        // with the same content but a different pointer.
+        private IntPtr _lastDialoguePtr = IntPtr.Zero;
         // Cooldown after dialogue text becomes empty (scene likely ending).
         // Prevents FindObjectOfType during scene destruction and stale reference AV.
         private int _searchCooldown = 0;
@@ -58,7 +63,7 @@ namespace SRWYAccess
             _sceneObjects = null;
             _lastDialogueText = "";
             _lastSpeakerName = "";
-            _findCycle = 0;
+            _lastDialoguePtr = IntPtr.Zero;
             _searchCooldown = 0;
             _staleTextCount = 0;
             RefsJustReleased = false;
@@ -85,8 +90,9 @@ namespace SRWYAccess
 
             string currentText = null;
             string currentSpeaker = null;
+            IntPtr currentDialoguePtr = IntPtr.Zero;
 
-            if (TryReadSDemoSystem(out currentText, out currentSpeaker))
+            if (TryReadSDemoSystem(out currentText, out currentSpeaker, out currentDialoguePtr))
             {
             }
             else if (TryReadTextDrawer(out currentText, out currentSpeaker))
@@ -107,12 +113,22 @@ namespace SRWYAccess
 
             if (string.IsNullOrWhiteSpace(currentText)) return;
 
-            // Only trigger on text change. Speaker-only changes for the same text
+            // Detect new dialogue entry by text content change OR IL2CPP string
+            // pointer change. When a character says the same line consecutively,
+            // text content is identical but the game allocates a new string object
+            // with a different pointer. Speaker-only changes for the same text
             // are rapid corrections by the game (e.g., 特工→艾蒂卡 in 124ms).
-            if (currentText != _lastDialogueText)
+            bool textChanged = currentText != _lastDialogueText;
+            bool ptrChanged = currentDialoguePtr != IntPtr.Zero
+                && currentDialoguePtr != _lastDialoguePtr;
+
+            if (textChanged || ptrChanged)
             {
+                if (ptrChanged && !textChanged)
+                    DebugHelper.Write($"ADH: Same text, new string ptr (0x{_lastDialoguePtr:X}→0x{currentDialoguePtr:X})");
                 _lastDialogueText = currentText;
                 _lastSpeakerName = currentSpeaker;
+                _lastDialoguePtr = currentDialoguePtr;
                 _staleTextCount = 0; // Reset: new text arrived
                 AnnounceDialogue(currentSpeaker, currentText);
             }
@@ -144,16 +160,36 @@ namespace SRWYAccess
                     return;
                 }
 
+                // SAFETY: ProbeObject before accessing properties to prevent AV
+                // on partially-destroyed objects returned by FindObjectOfType
+                if (!SafeCall.ProbeObject(freshSub.Pointer))
+                {
+                    _subtitleHandler = null;
+                    return;
+                }
+
                 string chapter = "";
                 string subtitle = "";
 
                 var chapterTmp = freshSub.chapterText;
-                if ((object)chapterTmp != null)
-                    chapter = chapterTmp.text ?? "";
+                if ((object)chapterTmp != null && SafeCall.TmpTextMethodAvailable)
+                {
+                    IntPtr strPtr = SafeCall.ReadTmpTextSafe(chapterTmp.Pointer);
+                    if (strPtr != IntPtr.Zero)
+                    {
+                        try { chapter = IL2CPP.Il2CppStringToManaged(strPtr) ?? ""; } catch { }
+                    }
+                }
 
                 var subtitleTmp = freshSub.subtitleText;
-                if ((object)subtitleTmp != null)
-                    subtitle = subtitleTmp.text ?? "";
+                if ((object)subtitleTmp != null && SafeCall.TmpTextMethodAvailable)
+                {
+                    IntPtr strPtr = SafeCall.ReadTmpTextSafe(subtitleTmp.Pointer);
+                    if (strPtr != IntPtr.Zero)
+                    {
+                        try { subtitle = IL2CPP.Il2CppStringToManaged(strPtr) ?? ""; } catch { }
+                    }
+                }
 
                 chapter = TextUtils.CleanRichText(chapter);
                 subtitle = TextUtils.CleanRichText(subtitle);
@@ -176,10 +212,11 @@ namespace SRWYAccess
             }
         }
 
-        private bool TryReadSDemoSystem(out string text, out string speaker)
+        private bool TryReadSDemoSystem(out string text, out string speaker, out IntPtr dialoguePtr)
         {
             text = null;
             speaker = null;
+            dialoguePtr = IntPtr.Zero;
 
             if ((object)_dialogueMessage == null) return false;
 
@@ -208,9 +245,32 @@ namespace SRWYAccess
                 return false;
             }
 
+            // SAFETY: ProbeObject before accessing properties to prevent AV
+            if (!SafeCall.ProbeObject(freshMsg.Pointer))
+            {
+                _dialogueMessage = null;
+                ReleaseDialogueRefs();
+                return false;
+            }
+
             try
             {
-                text = freshMsg._currentShowingMessage;
+                // SAFETY: Use SafeCall to read string field. IL2CPP string field access
+                // internally calls Il2CppStringToManaged which reads native string memory.
+                // If the string has been freed during scene transition, this causes an
+                // uncatchable AV in .NET 6. SafeCall reads the string pointer via VEH
+                // and probes the string object before Il2CppStringToManaged.
+                if (SafeCall.AdventureFieldsAvailable)
+                {
+                    text = SafeCall.ReadIl2CppStringFieldSafe(freshMsg.Pointer, SafeCall.OffsetSDemoCurrentShowingMessage);
+                    // Read raw IL2CPP string pointer for same-text detection.
+                    // Even when text content is identical, different dialogue entries
+                    // produce different string objects with different pointers.
+                    dialoguePtr = SafeCall.ReadFieldPtrSafe(freshMsg.Pointer, SafeCall.OffsetSDemoCurrentShowingMessage);
+                }
+                else
+                    text = freshMsg._currentShowingMessage;
+
                 if (string.IsNullOrWhiteSpace(text))
                 {
                     ReleaseDialogueRefs();
@@ -253,12 +313,29 @@ namespace SRWYAccess
                 return false;
             }
 
+            // SAFETY: ProbeObject before accessing properties to prevent AV
+            if (!SafeCall.ProbeObject(freshDrawer.Pointer))
+            {
+                _textDrawer = null;
+                ReleaseDialogueRefs();
+                return false;
+            }
+
             try
             {
                 var textComp = freshDrawer._text;
                 if ((object)textComp == null) return false;
 
-                text = textComp.text;
+                // CRITICAL: Use SafeCall to read text
+                if (SafeCall.TmpTextMethodAvailable)
+                {
+                    IntPtr strPtr = SafeCall.ReadTmpTextSafe(textComp.Pointer);
+                    if (strPtr != IntPtr.Zero)
+                    {
+                        try { text = IL2CPP.Il2CppStringToManaged(strPtr); } catch { }
+                    }
+                }
+
                 if (string.IsNullOrWhiteSpace(text))
                 {
                     ReleaseDialogueRefs();
@@ -282,8 +359,13 @@ namespace SRWYAccess
             try
             {
                 var freshSpeaker = UnityEngine.Object.FindObjectOfType<SDemoSpeakerName>();
-                if ((object)freshSpeaker != null)
+                if ((object)freshSpeaker != null && SafeCall.ProbeObject(freshSpeaker.Pointer))
+                {
+                    // SAFETY: Use SafeCall to read string field (prevents AV on freed string)
+                    if (SafeCall.AdventureFieldsAvailable && SafeCall.OffsetSDemoSpeakerName > 0)
+                        return SafeCall.ReadIl2CppStringFieldSafe(freshSpeaker.Pointer, SafeCall.OffsetSDemoSpeakerName);
                     return freshSpeaker._speakerName;
+                }
                 _speakerName = null;
             }
             catch
@@ -310,10 +392,15 @@ namespace SRWYAccess
             _subtitleHandler = null;
             _lastSubtitleText = "";
             _lastChapterText = "";
-            _searchCooldown = ModConfig.AdvSearchCooldown;
+            // Clear dialogue tracking so same text reappearing after transition
+            // is announced (e.g., scene end → new scene with same first line).
+            _lastDialogueText = "";
+            _lastSpeakerName = "";
+            _lastDialoguePtr = IntPtr.Zero;
+            _searchCooldown = ModConfig.AdvSearchCooldownEffective;
             _staleTextCount = 0;
             RefsJustReleased = true;
-            DebugHelper.Write("ADH: Dialogue text empty, released refs (cooldown 1.5s)");
+            DebugHelper.Write($"ADH: Dialogue text empty, released refs (cooldown {ModConfig.AdvSearchCooldownEffective} cycles)");
         }
 
         private bool TryReadSceneObjects(out string text, out string speaker)
@@ -341,11 +428,25 @@ namespace SRWYAccess
                 return false;
             }
 
+            // SAFETY: ProbeObject before accessing properties to prevent AV
+            if (!SafeCall.ProbeObject(freshScene.Pointer))
+            {
+                _sceneObjects = null;
+                ReleaseDialogueRefs();
+                return false;
+            }
+
             try
             {
                 var dialogTmp = freshScene.dialogText;
-                if ((object)dialogTmp != null)
-                    text = dialogTmp.text;
+                if ((object)dialogTmp != null && SafeCall.TmpTextMethodAvailable)
+                {
+                    IntPtr strPtr = SafeCall.ReadTmpTextSafe(dialogTmp.Pointer);
+                    if (strPtr != IntPtr.Zero)
+                    {
+                        try { text = IL2CPP.Il2CppStringToManaged(strPtr); } catch { }
+                    }
+                }
 
                 if (string.IsNullOrWhiteSpace(text))
                 {
@@ -355,8 +456,14 @@ namespace SRWYAccess
                 }
 
                 var speakerTmp = freshScene.speakerNameText;
-                if ((object)speakerTmp != null)
-                    speaker = speakerTmp.text;
+                if ((object)speakerTmp != null && SafeCall.TmpTextMethodAvailable)
+                {
+                    IntPtr strPtr = SafeCall.ReadTmpTextSafe(speakerTmp.Pointer);
+                    if (strPtr != IntPtr.Zero)
+                    {
+                        try { speaker = IL2CPP.Il2CppStringToManaged(strPtr); } catch { }
+                    }
+                }
             }
             catch
             {
@@ -369,79 +476,55 @@ namespace SRWYAccess
 
         private void FindDialogueObjects()
         {
-            int startSlot = _findCycle;
+            // Batch search: find ALL missing object types in one call.
+            // Each FindObjectOfType for these small MonoBehaviour types is
+            // lightweight (~0.1ms), and batching reduces initial discovery
+            // from ~500ms (5 types × 3 poll slots) to ~33ms (1 poll cycle).
             try
             {
-                for (int i = 0; i < 5; i++)
+                if ((object)_dialogueMessage == null)
                 {
-                    int slot = (startSlot + i) % 5;
-                    switch (slot)
+                    _dialogueMessage = UnityEngine.Object.FindObjectOfType<SDemoDialogueMessage>();
+                    if ((object)_dialogueMessage != null)
                     {
-                        case 0:
-                            if ((object)_dialogueMessage == null)
-                            {
-                                _findCycle = (slot + 1) % 5;
-                                _dialogueMessage = UnityEngine.Object.FindObjectOfType<SDemoDialogueMessage>();
-                                if ((object)_dialogueMessage != null)
-                                {
-                                    DebugHelper.Write("ADH: Found SDemoDialogueMessage");
-                                    // SDemoSpeakerName is always paired with SDemoDialogueMessage.
-                                    // Find it now to avoid announcing the first line without speaker name.
-                                    // Safe: if SDemoDialogueMessage exists, the scene is stable.
-                                    if ((object)_speakerName == null)
-                                    {
-                                        _speakerName = UnityEngine.Object.FindObjectOfType<SDemoSpeakerName>();
-                                        if ((object)_speakerName != null)
-                                        {
-                                            DebugHelper.Write("ADH: Found SDemoSpeakerName (paired)");
-                                            _findCycle = 2; // skip slot 1, already found
-                                        }
-                                    }
-                                }
-                                return;
-                            }
-                            break;
-                        case 1:
-                            if ((object)_speakerName == null)
-                            {
-                                _findCycle = (slot + 1) % 5;
-                                _speakerName = UnityEngine.Object.FindObjectOfType<SDemoSpeakerName>();
-                                if ((object)_speakerName != null)
-                                    DebugHelper.Write("ADH: Found SDemoSpeakerName");
-                                return;
-                            }
-                            break;
-                        case 2:
-                            if ((object)_textDrawer == null)
-                            {
-                                _findCycle = (slot + 1) % 5;
-                                _textDrawer = UnityEngine.Object.FindObjectOfType<SDemoDialogueTextDrawer>();
-                                if ((object)_textDrawer != null)
-                                    DebugHelper.Write("ADH: Found SDemoDialogueTextDrawer");
-                                return;
-                            }
-                            break;
-                        case 3:
-                            if ((object)_subtitleHandler == null)
-                            {
-                                _findCycle = (slot + 1) % 5;
-                                _subtitleHandler = UnityEngine.Object.FindObjectOfType<SubtitleUIHandler>();
-                                if ((object)_subtitleHandler != null)
-                                    DebugHelper.Write("ADH: Found SubtitleUIHandler");
-                                return;
-                            }
-                            break;
-                        case 4:
-                            if ((object)_sceneObjects == null)
-                            {
-                                _findCycle = (slot + 1) % 5;
-                                _sceneObjects = UnityEngine.Object.FindObjectOfType<AdventureSceneObjects>();
-                                if ((object)_sceneObjects != null)
-                                    DebugHelper.Write("ADH: Found AdventureSceneObjects");
-                                return;
-                            }
-                            break;
+                        DebugHelper.Write("ADH: Found SDemoDialogueMessage");
+                        // SDemoSpeakerName is always paired with SDemoDialogueMessage.
+                        // Find it now to avoid announcing the first line without speaker name.
+                        if ((object)_speakerName == null)
+                        {
+                            _speakerName = UnityEngine.Object.FindObjectOfType<SDemoSpeakerName>();
+                            if ((object)_speakerName != null)
+                                DebugHelper.Write("ADH: Found SDemoSpeakerName (paired)");
+                        }
                     }
+                }
+
+                if ((object)_speakerName == null)
+                {
+                    _speakerName = UnityEngine.Object.FindObjectOfType<SDemoSpeakerName>();
+                    if ((object)_speakerName != null)
+                        DebugHelper.Write("ADH: Found SDemoSpeakerName");
+                }
+
+                if ((object)_textDrawer == null)
+                {
+                    _textDrawer = UnityEngine.Object.FindObjectOfType<SDemoDialogueTextDrawer>();
+                    if ((object)_textDrawer != null)
+                        DebugHelper.Write("ADH: Found SDemoDialogueTextDrawer");
+                }
+
+                if ((object)_subtitleHandler == null)
+                {
+                    _subtitleHandler = UnityEngine.Object.FindObjectOfType<SubtitleUIHandler>();
+                    if ((object)_subtitleHandler != null)
+                        DebugHelper.Write("ADH: Found SubtitleUIHandler");
+                }
+
+                if ((object)_sceneObjects == null)
+                {
+                    _sceneObjects = UnityEngine.Object.FindObjectOfType<AdventureSceneObjects>();
+                    if ((object)_sceneObjects != null)
+                        DebugHelper.Write("ADH: Found AdventureSceneObjects");
                 }
             }
             catch (Exception ex)

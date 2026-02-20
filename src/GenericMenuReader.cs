@@ -5,10 +5,16 @@ using UnityEngine.UI;
 using Il2CppCom.BBStudio.SRTeam.Inputs;
 using Il2CppCom.BBStudio.SRTeam.UIs;
 using Il2CppCom.BBStudio.SRTeam.UIs.SelectParts;
+using Il2CppCom.BBStudio.SRTeam.UIs.SelectSpecialCommand;
 using Il2CppCom.BBStudio.SRTeam.UIs.WeaponList;
+using Il2CppCom.BBStudio.SRTeam.UIs.StatusUI;
+using Il2CppCom.BBStudio.SRTeam.UIs.StatusUI.PilotStatus;
+using Il2CppCom.BBStudio.SRTeam.UIs.StatusUI.RobotStatus;
+using Il2CppCom.BBStudio.SRTeam.UIs.StatusUI.WeaponStatus;
 using Il2CppCom.BBStudio.SRTeam.Manager;
 using Il2CppInterop.Runtime;
 using Il2CppTMPro;
+using UnityEngine.EventSystems;
 
 namespace SRWYAccess
 {
@@ -56,6 +62,13 @@ namespace SRWYAccess
         // Flag: set when a new handler is found, cleared after first cursor read
         private bool _newHandlerJustFound;
 
+        // Init skip: after finding a new handler, skip N cycles before
+        // accessing IL2CPP fields. The UI may not be fully initialized
+        // on the first few frames (TMP objects being created/populated).
+        // The initial announcement happens in the same cycle as finding,
+        // but subsequent reads are delayed.
+        private int _initSkipCount;
+
         private int _missCount;
         private int _faultCount;
 
@@ -69,7 +82,9 @@ namespace SRWYAccess
         private static readonly HashSet<string> _skipTypes = new HashSet<string>(StringComparer.OrdinalIgnoreCase)
         {
             "DialogSystem",
-            "SimpleBattleHandler" // transient battle animation handler, freed during transitions → AV crash
+            "SimpleBattleHandler", // transient battle animation handler, freed during transitions → AV crash
+            "SingleSimpleBattleHandler", // same as SimpleBattleHandler: transient, freed mid-transition → AV crash
+            "SubtitleUIHandler" // handled by AdventureDialogueHandler, freed during ADVENTURE->NONE transitions → AV crash
         };
 
         // Info screen types: read all visible TMP text as fallback
@@ -77,13 +92,25 @@ namespace SRWYAccess
         {
             "StatusUIHandler",
             "TacticalPartStatusUIHandler",
-            "CustomRobotUIHandler",
+            // CustomRobotUIHandler: now has dedicated handler (UpdateCustomRobotHandler)
             "UpdateUIHandler",
             "RankUpAnimationHandler",
             "ConversionUIHandler",
-            "PilotTrainingUIHandler",
             "HandoverUIHandler",
-            "TransferUIHandler"
+            "TransferUIHandler",
+            // Newly covered info screens:
+            "SaveConfirmDialogUIHandler",  // save confirm dialog with messageText
+            "PrologueSystem",              // prologue narrative text
+            "FullCustomBonusUIHandler",    // custom bonus choice/description panel
+            "CustomBonusEffectUIHandler",  // custom bonus effect display
+            "OptionUIHandler",             // system options panel
+            "OptionUIHandlerV",            // system options variant
+            "LibraryPlayerRecordUIHandler", // player records display
+            "LicenceWindowUIHandler",      // license/legal text scroll
+            "DesignWorkUIHandler",         // design work viewer
+            "ResultDisplay",               // post-battle result display (war report, bonus)
+            "ResultDisplay2",              // post-battle result display (parts, skills)
+            "BattleDetailsUIHandler"       // battle detail panel (skills, abilities)
         };
 
         // Structured review types: read specific TMP fields for result/detail screens
@@ -97,6 +124,7 @@ namespace SRWYAccess
             "BonusUIHandler",
             "CreditWindowUIHandler",
             "AssistLinkManager",
+            "AssistLinkSystem",
             "SurvivalMissionResultUIHandler",
             "MissionChartUIHandler"
         };
@@ -121,18 +149,15 @@ namespace SRWYAccess
         // currentCursorIndex. Track selection changes for grid-based navigation.
         private int _lastAssistSelectNo = -1;
 
-        // AssistLink data cache: GetAssistLinkData returns mutable/reused object.
-        // Second call returns empty fields. Cache all fields during cursor
-        // navigation (ReadAssistLinkItemText) for use during screen review.
+        // AssistLink data cache: names from TMP (deferred read).
+        // Effect text from TMP fields (deferred read).
         private string _cachedALId;
         private string _cachedALPersonName;
         private string _cachedALCommandName;
-        private string _cachedALCmdStr;
-        private string _cachedALLvCmdStr;
-        private string _cachedALPassiveStr;
-        private string _cachedALLvPassiveStr;
-        private string _cachedALTarget;
-        private string _cachedALDuration;
+        private string _cachedALCmdStr;     // populated from TMP in deferred read
+        private string _cachedALPassiveStr; // populated from TMP in deferred read
+        private int _cachedALLevel = -1;    // from workCopy
+        private bool _cachedALRegistered;   // from workCopy
 
         // Track extra command buttons that cursor doesn't navigate to
         // (e.g. LandformAction in TacticallPartCommandUIHandler)
@@ -141,6 +166,42 @@ namespace SRWYAccess
         // Track TacticallPartCommandUIHandler mode (map menu vs unit commands)
         private bool _isMapMenu;
         private int _lastCommandType = -1; // ShowCommandType enum value
+
+        // PilotTrainingUIHandler tracking: uses sub-handler cursors, not
+        // UIHandlerBase.currentCursorIndex. Track tab (menuType), list type
+        // (currentSelectType), and cursor (m_CurrentIndex) separately.
+        private int _lastTrainingMenuType = -2; // -2 = unset (MenuType.Default = -1)
+        private int _lastTrainingSelectType = -1;
+        private int _lastTrainingCursorIndex = -1;
+
+        // StatusUIHandler tab tracking: PILOT=0, ROBOT=1, WEAPON=2
+        private int _lastStatusUIType = -2; // -2 = unset
+
+        // CharacterSelectionUIHandler tracking: selectCharacter (BOY=0/GIRL=1) + stateType
+        private int _lastCharSelectCharacter = -1;
+        private int _lastCharSelectState = -1;
+        private int _charSelectReadDelay;  // deferred read: wait for animation to update TMP
+
+        // CustomRobotUIHandler tracking: robot index for Q/E switch detection
+        private int _lastCustomRobotIndex = -1;
+        private IntPtr _lastSelectedButtonPtr = IntPtr.Zero;
+
+        // Deferred description read: the game updates TMP description text
+        // (explanationText, descriptionText) AFTER our hook runs in
+        // InputManager.Update(). Reading immediately on cursor change gets
+        // stale text. Use a countdown timer so the game has time to update.
+        // Also handles rapid navigation: repeated cursor changes reset the
+        // timer, so only the final position's description is read.
+        private int _descriptionDelay;       // countdown: >0 = waiting, fires at 0
+        private int _descriptionRetries;     // retry count if read returns empty
+        private int _descriptionCursorIndex; // cursor index for shop item detail
+
+        // Sort/filter text tracking: monitor TMP text from list handlers
+        // and announce when the sort/filter type changes (e.g., G key press).
+        private TextMeshProUGUI _sortTmp;
+        private TextMeshProUGUI _filterTmp;
+        private string _lastSortText = "";
+        private string _lastFilterText = "";
 
         public bool HasHandler => (object)_activeHandler != null;
         public IntPtr CurrentHandlerPtr => _lastHandlerPtr;
@@ -158,6 +219,7 @@ namespace SRWYAccess
             _typeSpecificCount = -1;
             _modeChangeCooldown = 0;
             _newHandlerJustFound = false;
+            _initSkipCount = 0;
             _cmdDiagDumped = false;
             _lastExtraButtonText = null;
             _isMapMenu = false;
@@ -172,11 +234,50 @@ namespace SRWYAccess
             _cachedALPersonName = null;
             _cachedALCommandName = null;
             _cachedALCmdStr = null;
-            _cachedALLvCmdStr = null;
             _cachedALPassiveStr = null;
-            _cachedALLvPassiveStr = null;
-            _cachedALTarget = null;
-            _cachedALDuration = null;
+            _cachedALLevel = -1;
+            _cachedALRegistered = false;
+            _lastTrainingMenuType = -2;
+            _lastTrainingSelectType = -1;
+            _lastTrainingCursorIndex = -1;
+            _lastStatusUIType = -2;
+            _lastCharSelectCharacter = -1;
+            _lastCharSelectState = -1;
+            _charSelectReadDelay = 0;
+            _lastCustomRobotIndex = -1;
+            _lastSelectedButtonPtr = IntPtr.Zero;
+            _descriptionDelay = 0;
+            _descriptionRetries = 0;
+            _sortTmp = null;
+            _filterTmp = null;
+            _lastSortText = "";
+            _lastFilterText = "";
+        }
+
+        /// <summary>
+        /// Force re-announcement on next poll cycle. Resets cursor tracking
+        /// but keeps the active handler cached. Used when Q/E (L1/R1) tab
+        /// switching changes content without moving the cursor.
+        /// </summary>
+        public void ForceReannounce()
+        {
+            _lastCursorIndex = -1;
+            _stalePollCount = 0;
+            _lastBattleCheckBtnType = -1;
+            _lastSpiritBtnPtr = IntPtr.Zero;
+            _lastOthersCmdBtnPtr = IntPtr.Zero;
+            _lastAssistSelectNo = -1;
+            _lastCommandType = -1;
+            _typeSpecificCount = -1;
+            _lastTrainingMenuType = -2;
+            _lastTrainingSelectType = -1;
+            _lastTrainingCursorIndex = -1;
+            _lastStatusUIType = -2;
+            _lastCharSelectCharacter = -1;
+            _lastCharSelectState = -1;
+            _charSelectReadDelay = 0;
+            _lastCustomRobotIndex = -1;
+            _lastSelectedButtonPtr = IntPtr.Zero;
         }
 
         /// <summary>
@@ -251,6 +352,47 @@ namespace SRWYAccess
                 return false;
             }
 
+            // SEH: Verify handler's native object is still accessible before any
+            // IL2CPP access. IsHandlerStillActive only checks InputManager's behaviour
+            // pointer, not the handler object itself. During transitions, the handler's
+            // native memory can be freed before the behaviour pointer updates.
+            if (!SafeCall.ProbeObject(_activeHandler.Pointer))
+            {
+                DebugHelper.Write($"GenericMenu: [{_activeHandlerType}] ProbeObject failed - handler freed");
+                ReleaseHandler();
+                return true;
+            }
+
+            // Init skip: after finding a new handler, skip a few cycles before
+            // doing further IL2CPP reads. The initial announcement already happened
+            // (in the same cycle as finding via _newHandlerJustFound), but the UI
+            // may still be initializing TMP objects on subsequent frames.
+            // ResultDisplay2 and other info screens crash on the 2nd cycle.
+            if (_initSkipCount > 0)
+            {
+                _initSkipCount--;
+                return false;
+            }
+
+            // Deferred description read: countdown timer gives the game multiple
+            // frames to update TMP description text after cursor change.
+            // Rapid navigation resets the timer, reading only the final position.
+            if (_descriptionDelay > 0)
+            {
+                _descriptionDelay--;
+                if (_descriptionDelay == 0)
+                {
+                    bool ok = ReadDeferredDescription();
+                    // Retry if the read returned empty (game may need more time).
+                    // AssistLink uses multi-phase deferred reads, needs more retries.
+                    if (!ok && _descriptionRetries < 5)
+                    {
+                        _descriptionDelay = 1; // retry next cycle
+                        _descriptionRetries++;
+                    }
+                }
+            }
+
             // Stale cursor detection: when cursor hasn't changed for many polls,
             // reduce IL2CPP access frequency to minimize AV exposure.
             // The handler's native object can be destroyed by Unity before
@@ -279,9 +421,10 @@ namespace SRWYAccess
             if (_activeHandlerType == "BattleCheckMenuHandler")
                 return UpdateBattleCheckHandler();
 
-            // Special: AssistLinkManager uses CursorInfo.SelectNo for grid navigation,
-            // not currentCursorIndex from UIHandlerBase.
-            if (_activeHandlerType == "AssistLinkManager")
+            // Special: AssistLinkManager/AssistLinkSystem uses CursorInfo.SelectNo
+            // for grid navigation, not currentCursorIndex from UIHandlerBase.
+            // AssistLinkSystem is the battle-time wrapper around AssistLinkManager.
+            if (_activeHandlerType == "AssistLinkManager" || _activeHandlerType == "AssistLinkSystem")
                 return UpdateAssistLinkHandler();
 
             // Special: PartsEquipUIHandler doesn't update currentCursorIndex.
@@ -289,16 +432,44 @@ namespace SRWYAccess
             if (_activeHandlerType == "PartsEquipUIHandler")
                 return UpdatePartsEquipHandler();
 
+            // Special: CharacterSelectionUIHandler (角色選擇) has two states:
+            // CHARACTERSELECTION (boy/girl) and CHARACTERSETTINGS (name/birthday/blood/confirm).
+            // Track EventSystem selection changes to read focused button text.
+            if (_activeHandlerType == "CharacterSelectionUIHandler")
+                return UpdateCharacterSelectionHandler();
+
+            // Special: CustomRobotUIHandler (機體改造) has robot switching (Q/E)
+            // and stat modification options. Track robot index changes and
+            // read CustomButton stat labels + values.
+            if (_activeHandlerType == "CustomRobotUIHandler")
+                return UpdateCustomRobotHandler();
+
+            // Special: StatusUIHandler has tabs (Pilot/Robot/Weapon).
+            // On the Weapon tab, track cursor changes and read weapon details
+            // instead of dumping all TMP text.
+            // TacticalPartStatusUIHandler extends StatusUIHandler (tactical map F key).
+            if (_activeHandlerType == "StatusUIHandler" || _activeHandlerType == "TacticalPartStatusUIHandler")
+                return UpdateStatusUIHandler();
+
+            // Special: PilotTrainingUIHandler uses sub-handler cursors
+            // (statusHandler.m_CurrentIndex / paramHandler.m_CurrentIndex),
+            // not UIHandlerBase.currentCursorIndex. Multiple list handlers
+            // exist; we switch between them based on currentSelectType.
+            if (_activeHandlerType == "PilotTrainingUIHandler")
+                return UpdatePilotTrainingHandler();
+
             // Read cursor index (IL2CPP access - but we just validated above)
             int currentIndex;
-            try
+            if (SafeCall.FieldsAvailable)
             {
-                currentIndex = _activeHandler.currentCursorIndex;
+                var (ok, idx) = SafeCall.ReadCursorIndexSafe(_activeHandler.Pointer);
+                if (!ok) { ReleaseHandler(); return true; }
+                currentIndex = idx;
             }
-            catch
+            else
             {
-                ReleaseHandler();
-                return true;
+                try { currentIndex = _activeHandler.currentCursorIndex; }
+                catch { ReleaseHandler(); return true; }
             }
 
             // Detect button list changes and command mode.
@@ -399,7 +570,8 @@ namespace SRWYAccess
             // MonitorExtraButtons does deep IL2CPP access (handler → buttonList →
             // button → TMP text). Double-check IsHandlerStillActive() to narrow
             // the TOCTOU window before accessing these objects.
-            if (_stalePollCount % 3 == 0 && IsHandlerStillActive())
+            if (_stalePollCount % 3 == 0 && IsHandlerStillActive()
+                && SafeCall.ProbeObject(_activeHandler.Pointer))
                 MonitorExtraButtons();
 
             // Reset fault counter on successful poll
@@ -421,7 +593,26 @@ namespace SRWYAccess
                 if ((object)handler == null) return false;
                 if (handler.Pointer == IntPtr.Zero) return false;
 
-                int btnType = (int)handler.curBattleCheckMenuButtonType;
+                // SEH-protected read: the IL2CPP property getter for
+                // curBattleCheckMenuButtonType dereferences native pointers
+                // that can be invalid on partially-freed objects during scene
+                // transitions, causing uncatchable AccessViolationException.
+                int btnType;
+                if (SafeCall.BattleCheckFieldAvailable)
+                {
+                    var (ok, val) = SafeCall.ReadBattleCheckBtnTypeSafe(handler.Pointer);
+                    if (!ok)
+                    {
+                        DebugHelper.Write("GenericMenu: [BattleCheckMenuHandler] SEH read failed - handler freed");
+                        ReleaseHandler();
+                        return true;
+                    }
+                    btnType = val;
+                }
+                else
+                {
+                    btnType = (int)handler.curBattleCheckMenuButtonType;
+                }
 
                 if (btnType == _lastBattleCheckBtnType)
                     return false; // no change
@@ -457,8 +648,8 @@ namespace SRWYAccess
         {
             try
             {
-                string leftSummary = ReadUnitPrediction(handler.leftUnitInfo, Loc.Get("battle_left"));
-                string rightSummary = ReadUnitPrediction(handler.rightUnitInfo, Loc.Get("battle_right"));
+                string leftSummary = ReadParamPrediction(handler.baseLeftMainParam, Loc.Get("battle_left"));
+                string rightSummary = ReadParamPrediction(handler.baseRightMainParam, Loc.Get("battle_right"));
 
                 if (!string.IsNullOrEmpty(leftSummary) && !string.IsNullOrEmpty(rightSummary))
                     ScreenReaderOutput.SayQueued(leftSummary + "  " + Loc.Get("battle_vs") + "  " + rightSummary);
@@ -473,26 +664,416 @@ namespace SRWYAccess
             }
         }
 
-        private static string ReadUnitPrediction(BattleCheckMenuUnitInfoHandler info, string side)
+        private static string ReadParamPrediction(BattleCheckMenuParametor param, string side)
         {
-            if ((object)info == null) return null;
+            if ((object)param == null) return null;
             try
             {
-                string robot = ReadTmpSafe(info.robotName);
-                string weapon = ReadTmpSafe(info.weaponName);
-                string hit = ReadTmpSafe(info.hitRate);
-                string damage = ReadTmpSafe(info.weaponDamage);
-                string crit = ReadTmpSafe(info.criticalRate);
-
-                string name = robot ?? "";
+                string robot = param.robotName ?? "";
+                string weapon = param.weaponName;
                 if (!string.IsNullOrWhiteSpace(weapon))
-                    name += " " + weapon;
+                    robot += " " + weapon;
 
-                if (string.IsNullOrWhiteSpace(name)) return null;
+                if (string.IsNullOrWhiteSpace(robot)) return null;
 
                 return Loc.Get("battle_prediction",
-                    side, name.Trim(),
-                    hit ?? "-", damage ?? "-", crit ?? "-");
+                    side, robot.Trim(),
+                    param.hitRate.ToString(),
+                    param.predictDamage.ToString(),
+                    param.criticalRate.ToString());
+            }
+            catch { return null; }
+        }
+
+        /// <summary>
+        /// Read deferred description text. Called after countdown timer reaches 0,
+        /// giving the game time to update TMP description fields.
+        /// Tries handler-specific readers first, then falls back to generic
+        /// GuideUIHandler.m_GuideText (universal help text shown in most menus).
+        /// Returns true if text was successfully read and announced, false if empty.
+        /// </summary>
+        private bool ReadDeferredDescription()
+        {
+            try
+            {
+                if ((object)_activeHandler == null) return true; // no handler, don't retry
+
+                string descText = null;
+
+                // Handler-specific description readers only.
+                // Only handlers with known description TMP fields are supported.
+                if (_activeHandlerType == "PilotTrainingUIHandler")
+                    descText = ReadPilotTrainingDescriptionText();
+                else if (_activeHandlerType == "ShopUIHandler")
+                    descText = ReadShopDescriptionText();
+                else if (_activeHandlerType == "SelectDogmaUIHandler"
+                    || _activeHandlerType == "SelectTacticalCommandUIHandler"
+                    || _activeHandlerType == "SelectSpecialCommandUIHandler")
+                    descText = ReadSpecialCommandDescriptionText();
+                else if (_activeHandlerType == "PartsEquipUIHandler")
+                    descText = ReadPartsEquipDescriptionText();
+                else if (_activeHandlerType == "TacticalPartSpiritUIHandler")
+                    descText = ReadSpiritDescriptionText();
+                else if (_activeHandlerType == "AssistLinkManager" || _activeHandlerType == "AssistLinkSystem")
+                {
+                    // Two-phase deferred read: names first, then effects.
+                    // Phase 1: names haven't been read yet (null).
+                    // Phase 2: names read, now read effects.
+                    if (_cachedALCommandName == null)
+                    {
+                        // Phase 1: read names from TMP (game has updated after delay)
+                        descText = ReadAssistLinkNamesFromTmp();
+                        if (!string.IsNullOrWhiteSpace(descText))
+                        {
+                            ScreenReaderOutput.Say(descText);
+                            // Schedule phase 2 for effects
+                            _descriptionDelay = 2;
+                            _descriptionRetries = 0;
+                            return true;
+                        }
+                        return false; // retry
+                    }
+                    else
+                    {
+                        // Phase 2: read effects from TMP
+                        descText = ReadAssistLinkDescriptionText();
+                    }
+                }
+                else
+                    return true; // no reader for this handler type, don't retry
+
+                if (!string.IsNullOrWhiteSpace(descText))
+                {
+                    ScreenReaderOutput.SayQueued(descText);
+                    return true;
+                }
+                return false;
+            }
+            catch { return false; }
+        }
+
+        /// <summary>Read spirit description/target text from SpiritInfoPageHandler.spiritTextList.</summary>
+        private string ReadSpiritDescriptionText()
+        {
+            try
+            {
+                var handler = _activeHandler.TryCast<TacticalPartSpiritUIHandler>();
+                if ((object)handler == null) return null;
+
+                var infoPage = handler.spiritInfoPageHandler;
+                if ((object)infoPage == null) return null;
+
+                var parts = new List<string>();
+
+                // spiritTextList contains rendered TMP elements for
+                // spirit description, target, and other detail text.
+                try
+                {
+                    var textList = infoPage.spiritTextList;
+                    if ((object)textList != null && textList.Count > 0)
+                    {
+                        for (int i = 0; i < textList.Count && i < 5; i++)
+                        {
+                            try
+                            {
+                                string t = ReadTmpSafe(textList[i]);
+                                if (!string.IsNullOrWhiteSpace(t))
+                                    parts.Add(t);
+                            }
+                            catch { }
+                        }
+                    }
+                }
+                catch { }
+
+                // Spirit cost
+                try
+                {
+                    string cost = ReadTmpSafe(infoPage.spiritCost);
+                    if (!string.IsNullOrWhiteSpace(cost))
+                        parts.Add(Loc.Get("spirit_cost") + " " + cost);
+                }
+                catch { }
+
+                return parts.Count > 0 ? string.Join(", ", parts) : null;
+            }
+            catch { return null; }
+        }
+
+        /// <summary>Get the AssistLinkManager from the active handler.
+        /// Works for both AssistLinkManager (direct) and AssistLinkSystem (via managerScript).</summary>
+        private AssistLinkManager GetActiveAssistLinkManager()
+        {
+            try
+            {
+                if (_activeHandlerType == "AssistLinkSystem")
+                {
+                    var als = _activeHandler.TryCast<AssistLinkSystem>();
+                    if ((object)als != null && als.Pointer != IntPtr.Zero)
+                        return als.managerScript;
+                }
+                else
+                {
+                    return _activeHandler.TryCast<AssistLinkManager>();
+                }
+            }
+            catch { }
+            return null;
+        }
+
+        /// <summary>Read assist link command/passive effect description.
+        /// ALWAYS reads from TMP fields (deferred 3 frames after cursor change).
+        /// <summary>
+        /// Phase 1 deferred read: read link name and character name from TMP fields.
+        /// Called 3 frames after cursor change, when game has updated TMP.
+        /// During battle, assist_link_work_copy order doesn't match visual display,
+        /// so GetAssistLinkData returns wrong names. TMP is the source of truth.
+        /// </summary>
+        private string ReadAssistLinkNamesFromTmp()
+        {
+            try
+            {
+                var alm = GetActiveAssistLinkManager();
+                if ((object)alm == null || alm.Pointer == IntPtr.Zero) return null;
+
+                string cmdName = null, personName = null;
+                try { var t = alm.command_name_text; if ((object)t != null) cmdName = ReadTmpSafe(t); } catch { }
+                try { var t = alm.select_chara_name_text; if ((object)t != null) personName = ReadTmpSafe(t); } catch { }
+
+                DebugHelper.Write($"GenericMenu: [AssistLink TMP] cmd=[{cmdName}] name=[{personName}]");
+
+                var sb = new System.Text.StringBuilder();
+                if (!string.IsNullOrWhiteSpace(cmdName))
+                {
+                    sb.Append(TextUtils.CleanRichText(cmdName));
+                    sb.Append(" - ");
+                }
+                if (!string.IsNullOrWhiteSpace(personName))
+                    sb.Append(TextUtils.CleanRichText(personName));
+
+                if (sb.Length == 0) return null; // TMP not ready yet, retry
+
+                // Append level and registered status
+                if (_cachedALLevel >= 0)
+                {
+                    sb.Append(" ");
+                    sb.Append(Loc.Get("assistlink_level", _cachedALLevel + 1));
+                }
+                if (_cachedALRegistered)
+                {
+                    sb.Append(" [");
+                    sb.Append(Loc.Get("assistlink_registered"));
+                    sb.Append("]");
+                }
+
+                // Only cache when we have actual data (keeps _cachedALCommandName
+                // null so retries stay in phase 1 until data arrives)
+                _cachedALCommandName = !string.IsNullOrWhiteSpace(cmdName) ? TextUtils.CleanRichText(cmdName) : "";
+                _cachedALPersonName = !string.IsNullOrWhiteSpace(personName) ? TextUtils.CleanRichText(personName) : "";
+
+                return sb.ToString();
+            }
+            catch { return null; }
+        }
+
+        /// <summary>Phase 2 deferred read: effects from TMP.
+        /// GetAssistLinkData effect fields (CommandStr, PassiveStr) are STALE during
+        /// battle - they contain effects from a previous/different item.
+        /// TMP fields are updated by the game's own UI update cycle and are reliable.</summary>
+        private string ReadAssistLinkDescriptionText()
+        {
+            try
+            {
+                var parts = new List<string>();
+                var alm = GetActiveAssistLinkManager();
+                if ((object)alm == null || alm.Pointer == IntPtr.Zero) return null;
+
+                // Command effect: ALWAYS read from TMP (reliable after deferred delay)
+                string cmdEffect = null;
+                try
+                {
+                    var tmp = alm.command_effect_text;
+                    if ((object)tmp != null)
+                        cmdEffect = ReadTmpSafe(tmp);
+                }
+                catch { }
+                if (!string.IsNullOrWhiteSpace(cmdEffect))
+                {
+                    _cachedALCmdStr = cmdEffect; // update cache for screen review
+                    parts.Add(Loc.Get("assistlink_command_effect", cmdEffect));
+                }
+
+                // Passive effect: ALWAYS read from TMP
+                string passiveEffect = null;
+                try
+                {
+                    var tmp = alm.passive_effect_text;
+                    if ((object)tmp != null)
+                        passiveEffect = ReadTmpSafe(tmp);
+                }
+                catch { }
+                if (!string.IsNullOrWhiteSpace(passiveEffect))
+                {
+                    _cachedALPassiveStr = passiveEffect; // update cache for screen review
+                    parts.Add(Loc.Get("assistlink_passive_effect", passiveEffect));
+                }
+
+                return parts.Count > 0 ? string.Join(", ", parts) : null;
+            }
+            catch { return null; }
+        }
+
+        /// <summary>Read description text from PilotTrainingUIHandler without announcing.</summary>
+        private string ReadPilotTrainingDescriptionText()
+        {
+            try
+            {
+                var handler = _activeHandler.TryCast<PilotTrainingUIHandler>();
+                if ((object)handler == null) return null;
+
+                var parts = new List<string>();
+
+                try
+                {
+                    var sh = handler.statusHandler;
+                    if ((object)sh != null)
+                    {
+                        var tmp = sh.explanationText;
+                        if ((object)tmp != null)
+                        {
+                            string t = ReadTmpSafe(tmp);
+                            if (!string.IsNullOrWhiteSpace(t))
+                                parts.Add(t);
+                        }
+                    }
+                }
+                catch { }
+
+                // Learn skill dialog info if showing
+                try
+                {
+                    var dialog = handler.LearnSkillDialog;
+                    if ((object)dialog != null)
+                    {
+                        var dialogGo = dialog.go;
+                        if ((object)dialogGo != null && dialogGo.activeInHierarchy)
+                        {
+                            string skillName = ReadTmpSafe(dialog.learningSkillProgramText);
+                            if (!string.IsNullOrWhiteSpace(skillName))
+                                parts.Add(Loc.Get("training_learning") + " " + skillName);
+
+                            string needBuy = ReadTmpSafe(dialog.needToBuyText);
+                            if (!string.IsNullOrWhiteSpace(needBuy))
+                                parts.Add(needBuy);
+
+                            string cost = ReadTmpSafe(dialog.costCreditText);
+                            if (!string.IsNullOrWhiteSpace(cost))
+                                parts.Add(Loc.Get("training_cost") + " " + cost);
+                        }
+                    }
+                }
+                catch { }
+
+                return parts.Count > 0 ? string.Join(", ", parts) : null;
+            }
+            catch { return null; }
+        }
+
+        /// <summary>Read description text from ShopUIHandler without announcing.</summary>
+        private string ReadShopDescriptionText()
+        {
+            try
+            {
+                var handler = _activeHandler.TryCast<ShopUIHandler>();
+                if ((object)handler == null) return null;
+
+                var parts = new List<string>();
+
+                // Per-item data from ShopListPanel
+                try
+                {
+                    var shopList = handler.shopList;
+                    if ((object)shopList != null)
+                    {
+                        var panels = shopList.GetShopListPanelInstances();
+                        if (panels != null)
+                        {
+                            ShopListPanel panel = null;
+                            for (int i = 0; i < panels.Count; i++)
+                            {
+                                try
+                                {
+                                    var p = panels[i];
+                                    if ((object)p != null && p.currentIndex == _descriptionCursorIndex)
+                                    { panel = p; break; }
+                                }
+                                catch { }
+                            }
+
+                            if ((object)panel != null)
+                            {
+                                string cost = ReadTmpSafe(panel.itemCost);
+                                if (!string.IsNullOrWhiteSpace(cost))
+                                    parts.Add(Loc.Get("shop_price") + " " + cost);
+
+                                string owned = ReadTmpSafe(panel.itemOwnCnt);
+                                if (!string.IsNullOrWhiteSpace(owned))
+                                    parts.Add(Loc.Get("shop_owned") + " " + owned);
+
+                                string buyCnt = ReadTmpSafe(panel.itemBuyCnt);
+                                if (!string.IsNullOrWhiteSpace(buyCnt) && buyCnt != "0")
+                                    parts.Add(Loc.Get("shop_buy_count") + " " + buyCnt);
+                            }
+                        }
+                    }
+                }
+                catch { }
+
+                // Explanation text
+                try
+                {
+                    string desc = ReadTmpSafe(handler.explanationText);
+                    if (!string.IsNullOrWhiteSpace(desc))
+                        parts.Add(desc);
+                }
+                catch { }
+
+                return parts.Count > 0 ? string.Join(", ", parts) : null;
+            }
+            catch { return null; }
+        }
+
+        /// <summary>Read description text from SelectSpecialCommandUIHandler without announcing.</summary>
+        private string ReadSpecialCommandDescriptionText()
+        {
+            try
+            {
+                var handler = _activeHandler.TryCast<SelectSpecialCommandUIHandler>();
+                if ((object)handler == null) return null;
+
+                var tmp = handler.descriptionText;
+                if ((object)tmp == null) return null;
+
+                return ReadTmpSafe(tmp);
+            }
+            catch { return null; }
+        }
+
+        /// <summary>Read description text from PartsEquipUIHandler without announcing.</summary>
+        private string ReadPartsEquipDescriptionText()
+        {
+            try
+            {
+                var handler = _activeHandler.TryCast<PartsEquipUIHandler>();
+                if ((object)handler == null) return null;
+
+                var equipHandler = handler.equipmentUIHandler;
+                if ((object)equipHandler == null) return null;
+
+                var tmp = equipHandler.explanationText;
+                if ((object)tmp == null) return null;
+
+                return ReadTmpSafe(tmp);
             }
             catch { return null; }
         }
@@ -543,11 +1124,11 @@ namespace SRWYAccess
         }
 
         /// <summary>
-        /// Special update path for AssistLinkManager.
+        /// Special update path for AssistLinkManager and AssistLinkSystem.
         /// This handler uses CursorInfo.SelectNo for grid-based navigation
         /// instead of UIHandlerBase.currentCursorIndex.
-        /// Reads name via AssistLinkData.Name (reliable) and enriches with
-        /// level/status from assist_link_work_copy data.
+        /// AssistLinkSystem is the battle-time wrapper; its managerScript field
+        /// provides access to the underlying AssistLinkManager.
         /// </summary>
         private bool UpdateAssistLinkHandler()
         {
@@ -558,12 +1139,19 @@ namespace SRWYAccess
                 string screenName = Loc.Get(screenKey);
                 if (screenName != screenKey)
                     ScreenReaderOutput.Say(screenName);
+                else if (_activeHandlerType == "AssistLinkSystem")
+                {
+                    // Fall back to AssistLinkManager screen name for battle context
+                    screenName = Loc.Get("screen_assistlinkmanager");
+                    if (screenName != "screen_assistlinkmanager")
+                        ScreenReaderOutput.Say(screenName);
+                }
                 DebugHelper.Write($"GenericMenu: [{_activeHandlerType}] assist link handler init");
             }
 
             try
             {
-                var alm = _activeHandler.TryCast<AssistLinkManager>();
+                var alm = GetActiveAssistLinkManager();
                 if ((object)alm == null) return false;
                 if (alm.Pointer == IntPtr.Zero) return false;
 
@@ -571,19 +1159,66 @@ namespace SRWYAccess
                 if ((object)curInfo == null) return false;
 
                 int selectNo = curInfo.SelectNo;
-                if (selectNo == _lastAssistSelectNo)
+
+                // Detect item change even when cursor position stays the same
+                // (e.g. after sorting reorders the list)
+                bool positionChanged = selectNo != _lastAssistSelectNo;
+                bool itemChanged = false;
+                if (!positionChanged && selectNo >= 0)
+                {
+                    try
+                    {
+                        var wc = alm.assist_link_work_copy;
+                        if ((object)wc != null && selectNo < wc.Count)
+                        {
+                            var wk = wc[selectNo];
+                            if ((object)wk != null)
+                            {
+                                string currentId = wk.id;
+                                if (!string.IsNullOrEmpty(currentId) && currentId != _cachedALId)
+                                    itemChanged = true;
+                            }
+                        }
+                    }
+                    catch { }
+                }
+
+                if (!positionChanged && !itemChanged)
                     return false;
 
                 _lastAssistSelectNo = selectNo;
                 _lastCursorIndex = selectNo;
 
-                // Include level/status in navigation announcement
-                string text = ReadAssistLinkItemText(alm, selectNo);
-                if (!string.IsNullOrWhiteSpace(text))
+                // Update _cachedALId to prevent false itemChanged on subsequent frames.
+                // (workCopy id may not match the visual item, but we only need it
+                // for change detection, not for data lookup.)
+                try
                 {
-                    ScreenReaderOutput.Say(text);
-                    DebugHelper.Write($"GenericMenu: [AssistLink] select={selectNo} text={text}");
+                    var workCopy = alm.assist_link_work_copy;
+                    if ((object)workCopy != null && selectNo < workCopy.Count)
+                    {
+                        var wk = workCopy[selectNo];
+                        if ((object)wk != null)
+                        {
+                            _cachedALId = wk.id;
+                            _cachedALLevel = wk.level;
+                            _cachedALRegistered = wk.regist;
+                        }
+                    }
                 }
+                catch { }
+
+                // During battle, assist_link_work_copy order does NOT match the
+                // visual display. GetAssistLinkData(workCopy[n].id) returns the
+                // WRONG item's names. TMP fields are the only reliable source.
+                // Defer ALL reading by 2 frames so the game updates TMP first.
+                _cachedALCommandName = null;
+                _cachedALPersonName = null;
+                _cachedALCmdStr = null;
+                _cachedALPassiveStr = null;
+                _descriptionDelay = 2;
+                _descriptionRetries = 0;
+                DebugHelper.Write($"GenericMenu: [AssistLink] select={selectNo} deferred to TMP");
             }
             catch (Exception ex)
             {
@@ -632,59 +1267,63 @@ namespace SRWYAccess
             }
             catch { }
 
-            // Step 2: Get display name + command name from AssistLinkData
-            // Use alm.GetAssistLinkData (AssistLinkManager version) which populates
-            // CommandName. The AssistManager version may not fill CommandName.
+            // Step 2: Get display name + command name from GetAssistLinkData.
+            // Name and CommandName fields are reliable. Effect fields (CommandStr,
+            // PassiveStr etc.) are NOT cached here - they are stale during battle.
+            // Effects are read from TMP in the deferred description reader.
             if (!string.IsNullOrEmpty(itemId))
             {
                 try
                 {
-                    // Primary: AssistLinkManager.GetAssistLinkData (UI handler version)
-                    // IMPORTANT: Cache ALL fields from the data object here because
-                    // GetAssistLinkData returns a mutable/reused object. A second call
-                    // (e.g. from screen review) returns empty fields.
+                    AssistManager.AssistLinkData data = null;
+
+                    // Primary: AssistManager (data manager) - pure dictionary lookup
                     try
                     {
-                        var data = alm.GetAssistLinkData(itemId);
-                        if ((object)data != null)
+                        var gm = GameManager.Instance;
+                        if ((object)gm != null && gm.Pointer != IntPtr.Zero)
+                        {
+                            var am = gm.assistManager;
+                            if ((object)am != null && am.Pointer != IntPtr.Zero)
+                                data = am.GetAssistLinkData(itemId);
+                        }
+                    }
+                    catch { }
+
+                    // Fallback: AssistLinkManager version
+                    if ((object)data == null)
+                    {
+                        try { data = alm.GetAssistLinkData(itemId); }
+                        catch { }
+                    }
+
+                    if ((object)data != null)
+                    {
+                        try
                         {
                             string name = data.Name;
                             if (!string.IsNullOrWhiteSpace(name))
                                 itemName = TextUtils.CleanRichText(name);
-
-                            try
-                            {
-                                string cmd = data.CommandName;
-                                if (!string.IsNullOrWhiteSpace(cmd))
-                                    commandName = TextUtils.CleanRichText(cmd);
-                            }
-                            catch { }
-
-                            // Cache all fields for screen review
-                            _cachedALId = itemId;
-                            _cachedALPersonName = itemName;
-                            _cachedALCommandName = commandName;
-                            try { _cachedALCmdStr = TextUtils.CleanRichText(data.CommandStr); } catch { _cachedALCmdStr = null; }
-                            try { _cachedALLvCmdStr = TextUtils.CleanRichText(data.LvExCommandStr); } catch { _cachedALLvCmdStr = null; }
-                            try { _cachedALPassiveStr = TextUtils.CleanRichText(data.PassiveStr); } catch { _cachedALPassiveStr = null; }
-                            try { _cachedALLvPassiveStr = TextUtils.CleanRichText(data.LvExPassiveStr); } catch { _cachedALLvPassiveStr = null; }
-                            try { _cachedALTarget = TextUtils.CleanRichText(data.Target); } catch { _cachedALTarget = null; }
-                            try { _cachedALDuration = TextUtils.CleanRichText(data.Duration); } catch { _cachedALDuration = null; }
                         }
-                    }
-                    catch
-                    {
-                        // Clear stale cache on error to prevent screen review
-                        // showing wrong data from the previous item
-                        _cachedALId = null;
-                        _cachedALPersonName = null;
-                        _cachedALCommandName = null;
+                        catch { }
+
+                        try
+                        {
+                            string cmd = data.CommandName;
+                            if (!string.IsNullOrWhiteSpace(cmd))
+                                commandName = TextUtils.CleanRichText(cmd);
+                        }
+                        catch { }
+
+                        // Cache name fields only. Effect fields (CommandStr, PassiveStr etc.)
+                        // are STALE during battle - they contain data from a previous item.
+                        // Effects will be read from TMP in the deferred description reader.
+                        _cachedALId = itemId;
+                        _cachedALPersonName = itemName;
+                        _cachedALCommandName = commandName;
+                        // Clear effect caches - will be populated from TMP later
                         _cachedALCmdStr = null;
-                        _cachedALLvCmdStr = null;
                         _cachedALPassiveStr = null;
-                        _cachedALLvPassiveStr = null;
-                        _cachedALTarget = null;
-                        _cachedALDuration = null;
                     }
 
                     // Fallback for commandName: GetActivationCommandText
@@ -698,9 +1337,6 @@ namespace SRWYAccess
                         }
                         catch { }
                     }
-
-                    // Diagnostic: log what we got
-                    DebugHelper.Write($"AssistLink item: id={itemId} Name=[{itemName}] CmdName=[{commandName}]");
 
                     // Fallback for itemName: AssistManager.GetAssistName
                     if (string.IsNullOrWhiteSpace(itemName))
@@ -721,6 +1357,15 @@ namespace SRWYAccess
                         }
                         catch { }
                     }
+
+                    // Update cache with fallback results
+                    _cachedALId = itemId;
+                    if (!string.IsNullOrWhiteSpace(itemName))
+                        _cachedALPersonName = itemName;
+                    if (!string.IsNullOrWhiteSpace(commandName))
+                        _cachedALCommandName = commandName;
+
+                    DebugHelper.Write($"AssistLink item: sel={selectNo} id={itemId} Name=[{itemName}] CmdName=[{commandName}] Lv={level} reg={registered}");
                 }
                 catch { }
             }
@@ -832,6 +1477,8 @@ namespace SRWYAccess
                 if (!string.IsNullOrWhiteSpace(text))
                 {
                     ScreenReaderOutput.Say(text);
+                    _descriptionDelay = 3;
+                    _descriptionRetries = 0;
                     DebugHelper.Write($"GenericMenu: [PartsEquip] cursor={curIdx} text={text}");
                 }
                 else
@@ -849,6 +1496,1306 @@ namespace SRWYAccess
         }
 
         /// <summary>
+        /// Special update path for CharacterSelectionUIHandler (角色選擇).
+        /// Two states tracked via stateType field:
+        ///   CHARACTERSELECTION (0): boy/girl selection via selectCharacter field
+        ///   CHARACTERSETTINGS (1): name/birthday/blood/confirm via EventSystem
+        ///
+        /// CHARACTERSELECTION: selectCharacter (BOY=0, GIRL=1) changes on L1/R1.
+        /// Track this field directly; ReadAllVisibleText shows character profile.
+        ///
+        /// CHARACTERSETTINGS: EventSystem tracks focused setting button.
+        /// </summary>
+        private bool UpdateCharacterSelectionHandler()
+        {
+            bool firstEntry = _newHandlerJustFound;
+            if (_newHandlerJustFound)
+            {
+                _newHandlerJustFound = false;
+                _lastSelectedButtonPtr = IntPtr.Zero;
+                _lastCharSelectCharacter = -1;
+                _lastCharSelectState = -1;
+                string screenKey = "screen_characterselectionuihandler";
+                string screenName = Loc.Get(screenKey);
+                if (screenName != screenKey)
+                    ScreenReaderOutput.Say(screenName);
+                DebugHelper.Write("GenericMenu: [CharacterSelectionUIHandler] init");
+            }
+
+            try
+            {
+                // TryCast to read selectCharacter and stateType fields
+                var handler = _activeHandler.TryCast<CharacterSelectionUIHandler>();
+                if ((object)handler == null)
+                {
+                    DebugHelper.Write("GenericMenu: [CharacterSelection] TryCast failed");
+                    return false;
+                }
+
+                int stateType = (int)handler.stateType;
+                int selectChar = (int)handler.selectCharacter;
+
+                // Detect state change (CHARACTERSELECTION ↔ CHARACTERSETTINGS)
+                bool stateChanged = (stateType != _lastCharSelectState);
+                if (stateChanged)
+                {
+                    _lastCharSelectState = stateType;
+                    _lastSelectedButtonPtr = IntPtr.Zero; // reset EventSystem tracking
+                    DebugHelper.Write($"GenericMenu: [CharacterSelection] state changed to {stateType}");
+                }
+
+                if (stateType == 0) // CHARACTERSELECTION (boy/girl)
+                {
+                    bool charChanged = (selectChar != _lastCharSelectCharacter);
+                    if (charChanged || firstEntry || stateChanged)
+                    {
+                        _lastCharSelectCharacter = selectChar;
+                        _stalePollCount = 0;
+
+                        // Deferred read: the game updates TMP text via animation
+                        // after selectCharacter changes. Reading immediately gets
+                        // stale text from the previous character. Wait 10 frames
+                        // (~330ms) for animation + TMP update to complete.
+                        _charSelectReadDelay = firstEntry ? 3 : 10;
+                        DebugHelper.Write($"GenericMenu: [CharacterSelection] char={selectChar} deferred read in {_charSelectReadDelay} frames");
+                    }
+
+                    // Deferred read countdown
+                    if (_charSelectReadDelay > 0)
+                    {
+                        _charSelectReadDelay--;
+                        if (_charSelectReadDelay == 0)
+                        {
+                            string profileText = ReadCharacterProfile(handler, selectChar);
+                            if (!string.IsNullOrWhiteSpace(profileText))
+                            {
+                                ScreenReaderOutput.Say(profileText);
+                                DebugHelper.Write($"GenericMenu: [CharacterSelection] char={selectChar} profile announced");
+                            }
+                            else
+                            {
+                                DebugHelper.Write($"GenericMenu: [CharacterSelection] char={selectChar} profile empty");
+                            }
+                        }
+                    }
+                    else
+                    {
+                        _stalePollCount++;
+                    }
+                }
+                else // CHARACTERSETTINGS (name/birthday/blood/confirm)
+                {
+                    var es = EventSystem.current;
+                    GameObject selectedGO = null;
+                    if ((object)es != null)
+                        selectedGO = es.currentSelectedGameObject;
+
+                    if ((object)selectedGO != null && selectedGO.Pointer != IntPtr.Zero)
+                    {
+                        IntPtr selectedPtr = selectedGO.Pointer;
+                        if (selectedPtr == _lastSelectedButtonPtr && !firstEntry && !stateChanged)
+                            return false;
+
+                        _lastSelectedButtonPtr = selectedPtr;
+                        _stalePollCount = 0;
+
+                        string text = ReadBestTmpText(selectedGO);
+                        if (!string.IsNullOrWhiteSpace(text))
+                        {
+                            ScreenReaderOutput.Say(text);
+                            DebugHelper.Write($"GenericMenu: [CharacterSelection] setting button: {text}");
+                        }
+                        else
+                        {
+                            string allText = ReadAllVisibleText();
+                            if (!string.IsNullOrWhiteSpace(allText))
+                                ScreenReaderOutput.Say(allText);
+                        }
+                    }
+                    else if (firstEntry || stateChanged)
+                    {
+                        // No EventSystem focus yet on state change → read all text
+                        string allText = ReadAllVisibleText();
+                        if (!string.IsNullOrWhiteSpace(allText))
+                            ScreenReaderOutput.SayQueued(allText);
+                    }
+                }
+            }
+            catch (Exception ex)
+            {
+                DebugHelper.Write($"GenericMenu: [CharacterSelection] error: {ex.Message}");
+            }
+
+            if (_faultCount > 0) _faultCount = 0;
+            return false;
+        }
+
+        /// <summary>
+        /// Read profile text for the selected character.
+        /// Both character panels are always active (side by side). The TMP array
+        /// from GetComponentsInChildren contains BOTH profiles sequentially:
+        ///   Section 1: GIRL (selectChar=1) profile data
+        ///   Section 2: BOY (selectChar=0) profile data
+        /// Each section starts with a "配音" label followed by the voice actor name.
+        /// We find the two sections by locating duplicate "配音" labels, then
+        /// pick the correct section based on selectCharacter.
+        /// </summary>
+        private string ReadCharacterProfile(CharacterSelectionUIHandler handler, int selectChar)
+        {
+            try
+            {
+                var go = _activeHandler.gameObject;
+                if ((object)go == null || go.Pointer == IntPtr.Zero) return null;
+
+                var tmps = go.GetComponentsInChildren<TextMeshProUGUI>(false);
+                if (tmps == null || tmps.Count == 0) return null;
+
+                // Read all TMP texts with their indices
+                var allTexts = new System.Collections.Generic.List<(int idx, string text)>();
+                for (int i = 0; i < tmps.Count; i++)
+                {
+                    var tmp = tmps[i];
+                    if ((object)tmp == null) continue;
+
+                    string t = null;
+                    if (SafeCall.TmpTextMethodAvailable)
+                    {
+                        IntPtr strPtr = SafeCall.ReadTmpTextSafe(tmp.Pointer);
+                        if (strPtr != IntPtr.Zero)
+                        {
+                            try
+                            {
+                                t = IL2CPP.Il2CppStringToManaged(strPtr);
+                                t = TextUtils.CleanRichText(t);
+                            }
+                            catch { }
+                        }
+                    }
+
+                    if (!string.IsNullOrWhiteSpace(t) && t.Length > 1)
+                        allTexts.Add((i, t));
+                }
+
+                // Find the two profile sections by locating duplicate label
+                // "配音" (Voice Actor) appears at the start of each profile
+                int firstVoiceIdx = -1;
+                int secondVoiceIdx = -1;
+                string voiceLabel = null;
+
+                for (int i = 0; i < allTexts.Count; i++)
+                {
+                    string t = allTexts[i].text;
+                    // The first non-header label that appears twice marks the profile start
+                    if (t == "CHARACTER SELECT" || t == "CHARACTER SETTING") continue;
+                    if (t.StartsWith("[") && t.EndsWith("]")) continue; // skip [Q], [E]
+
+                    // Look for this same text later in the list
+                    for (int j = i + 1; j < allTexts.Count; j++)
+                    {
+                        if (allTexts[j].text == t)
+                        {
+                            firstVoiceIdx = i;
+                            secondVoiceIdx = j;
+                            voiceLabel = t;
+                            break;
+                        }
+                    }
+                    if (firstVoiceIdx >= 0) break;
+                }
+
+                if (firstVoiceIdx < 0 || secondVoiceIdx < 0)
+                {
+                    DebugHelper.Write($"[CharSel] could not find two profile sections");
+                    return ReadAllVisibleText();
+                }
+
+                DebugHelper.Write($"[CharSel] sections at {firstVoiceIdx},{secondVoiceIdx} label='{voiceLabel}'");
+
+                // Section 1 (firstVoiceIdx..secondVoiceIdx-1) = GIRL (selectChar=1)
+                // Section 2 (secondVoiceIdx..end) = BOY (selectChar=0)
+                int startIdx, endIdx;
+                if (selectChar == 1) // GIRL
+                {
+                    startIdx = firstVoiceIdx;
+                    endIdx = secondVoiceIdx;
+                }
+                else // BOY
+                {
+                    startIdx = secondVoiceIdx;
+                    endIdx = allTexts.Count;
+                }
+
+                var profileTexts = new System.Collections.Generic.List<string>();
+                int charCount = 0;
+                for (int i = startIdx; i < endIdx && profileTexts.Count < 20 && charCount < 500; i++)
+                {
+                    string t = allTexts[i].text;
+                    if (t.StartsWith("[") && t.EndsWith("]")) continue; // skip [Q], [E]
+                    if (t == "HOLD") continue;
+                    if (!IsNumericOnly(t))
+                    {
+                        profileTexts.Add(t);
+                        charCount += t.Length;
+                    }
+                }
+
+                DebugHelper.Write($"[CharSel] char={selectChar} read {profileTexts.Count} items");
+                return profileTexts.Count > 0 ? string.Join("  ", profileTexts) : null;
+            }
+            catch (Exception ex)
+            {
+                DebugHelper.Write($"[CharSel] ReadCharacterProfile error: {ex.Message}");
+                return ReadAllVisibleText();
+            }
+        }
+
+        /// <summary>
+        /// Special update path for CustomRobotUIHandler (機體改造).
+        /// Tracks robot switching (Q/E via robotIndex) and selected button
+        /// via EventSystem.current.currentSelectedGameObject (this handler
+        /// does NOT update UIHandlerBase.currentCursorIndex).
+        /// </summary>
+        private bool UpdateCustomRobotHandler()
+        {
+            if (_newHandlerJustFound)
+            {
+                _newHandlerJustFound = false;
+                _lastCustomRobotIndex = -1;
+                _lastSelectedButtonPtr = IntPtr.Zero;
+                string screenKey = "screen_" + _activeHandlerType.ToLowerInvariant();
+                string screenName = Loc.Get(screenKey);
+                if (screenName != screenKey)
+                    ScreenReaderOutput.Say(screenName);
+                DebugHelper.Write($"GenericMenu: [{_activeHandlerType}] custom robot handler init");
+            }
+
+            if (!SafeCall.CustomRobotFieldsAvailable)
+                return UpdateCustomRobotFallback();
+
+            try
+            {
+                IntPtr handlerPtr = _activeHandler.Pointer;
+                if (handlerPtr == IntPtr.Zero) return false;
+
+                // Read robotIndex pointer
+                IntPtr riPtr = SafeCall.ReadCustomRobotIndexPtr(handlerPtr);
+                if (riPtr == IntPtr.Zero)
+                    return UpdateCustomRobotFallback();
+
+                // Check robot index for Q/E switch
+                int robotIdx = SafeCall.ReadRobotIndexValue(riPtr);
+                bool robotChanged = (robotIdx != _lastCustomRobotIndex && _lastCustomRobotIndex != -1);
+                bool firstEntry = (_lastCustomRobotIndex == -1);
+
+                if (robotIdx != _lastCustomRobotIndex)
+                {
+                    _lastCustomRobotIndex = robotIdx;
+
+                    // Read current robot name
+                    IntPtr robotPtr = SafeCall.ReadRobotIndexCurrentPtr(riPtr);
+                    string robotName = null;
+                    if (robotPtr != IntPtr.Zero)
+                        robotName = SafeCall.ReadRobotNameSafe(robotPtr);
+
+                    int count = SafeCall.ReadRobotIndexCount(riPtr);
+
+                    if (!string.IsNullOrEmpty(robotName))
+                    {
+                        if (count > 0)
+                        {
+                            string msg = string.Format(Loc.Get("custom_robot_switch"),
+                                robotName, robotIdx + 1, count);
+                            ScreenReaderOutput.Say(msg);
+                        }
+                        else
+                        {
+                            ScreenReaderOutput.Say(robotName);
+                        }
+                        DebugHelper.Write($"GenericMenu: [CustomRobot] robot={robotName} idx={robotIdx} count={count}");
+                    }
+
+                    // On robot switch, force re-announce current button
+                    if (robotChanged)
+                        _lastSelectedButtonPtr = IntPtr.Zero;
+                }
+
+                // Detect selected button via EventSystem (currentCursorIndex not updated by this handler)
+                var es = EventSystem.current;
+                if ((object)es == null) return false;
+                var selectedGO = es.currentSelectedGameObject;
+                if ((object)selectedGO == null || selectedGO.Pointer == IntPtr.Zero)
+                    return false;
+
+                IntPtr selectedPtr = selectedGO.Pointer;
+                if (selectedPtr == _lastSelectedButtonPtr && !firstEntry)
+                    return false;
+
+                _lastSelectedButtonPtr = selectedPtr;
+                _stalePollCount = 0;
+
+                // Get buttons list and find which button matches the selected gameobject
+                IntPtr customPtr = SafeCall.ReadCustomCustomPtr(handlerPtr);
+                if (customPtr == IntPtr.Zero)
+                    return false;
+
+                IntPtr buttonsPtr = SafeCall.ReadCustomButtonsPtr(customPtr);
+                if (buttonsPtr == IntPtr.Zero)
+                    return false;
+
+                var buttons = new Il2CppSystem.Collections.Generic.List<
+                    Il2CppCom.BBStudio.SRTeam.UI.StrategyPart.Custom.CustomButton>(buttonsPtr);
+                int btnCount = buttons.Count;
+                int matchedIndex = -1;
+
+                for (int i = 0; i < btnCount; i++)
+                {
+                    var btn = buttons[i];
+                    if ((object)btn == null || btn.Pointer == IntPtr.Zero) continue;
+                    try
+                    {
+                        var btnGO = btn.gameObject;
+                        if ((object)btnGO != null && btnGO.Pointer == selectedPtr)
+                        {
+                            matchedIndex = i;
+                            break;
+                        }
+                    }
+                    catch { }
+                }
+
+                if (matchedIndex < 0)
+                {
+                    DebugHelper.Write($"GenericMenu: [CustomRobot] selected GO not in button list");
+                    return false;
+                }
+
+                // Read stat text for matched button
+                string statText = ReadCustomButtonText(buttonsPtr, matchedIndex);
+                if (!string.IsNullOrWhiteSpace(statText))
+                {
+                    ScreenReaderOutput.Say(statText);
+                    DebugHelper.Write($"GenericMenu: [CustomRobot] btn={matchedIndex} stat={statText}");
+                }
+            }
+            catch (Exception ex)
+            {
+                DebugHelper.Write($"GenericMenu: CustomRobot error: {ex.GetType().Name}: {ex.Message}");
+            }
+
+            if (_faultCount > 0) _faultCount = 0;
+            return false;
+        }
+
+        // EButtonIndex stat name keys (HP=0, EN=1, AR=2, MO=3, SI=4, WP=5)
+        private static readonly string[] _customStatKeys = {
+            "custom_stat_hp", "custom_stat_en", "custom_stat_ar",
+            "custom_stat_mo", "custom_stat_si", "custom_stat_wp"
+        };
+
+        /// <summary>
+        /// Read stat label and values from a CustomButton at the given index.
+        /// Stat label comes from EButtonIndex enum mapping, not from TMP text
+        /// (textBefore/textAfter show numeric values, not labels).
+        /// </summary>
+        private string ReadCustomButtonText(IntPtr buttonsListPtr, int index)
+        {
+            try
+            {
+                var buttons = new Il2CppSystem.Collections.Generic.List<Il2CppCom.BBStudio.SRTeam.UI.StrategyPart.Custom.CustomButton>(buttonsListPtr);
+                if (index < 0 || index >= buttons.Count)
+                    return null;
+
+                var btn = buttons[index];
+                if ((object)btn == null || btn.Pointer == IntPtr.Zero)
+                    return null;
+                if (!SafeCall.ProbeObject(btn.Pointer))
+                    return null;
+
+                // Get stat name from EButtonIndex mapping
+                string label = index < _customStatKeys.Length
+                    ? Loc.Get(_customStatKeys[index])
+                    : $"Stat {index}";
+
+                // Read valueBefore and valueAfter
+                int valBefore = btn.valueBefore;
+                int valAfter = btn.valueAfter;
+
+                if (valBefore != valAfter && valAfter != 0)
+                {
+                    return string.Format(Loc.Get("custom_stat_change"),
+                        label, valBefore, valAfter);
+                }
+                else
+                {
+                    return string.Format(Loc.Get("custom_stat"),
+                        label, valBefore);
+                }
+            }
+            catch (Exception ex)
+            {
+                DebugHelper.Write($"GenericMenu: ReadCustomButtonText error: {ex.Message}");
+                return null;
+            }
+        }
+
+        /// <summary>
+        /// Fallback for CustomRobotUIHandler when SafeCall fields are unavailable.
+        /// Tracks selected button via EventSystem and reads all visible TMP text.
+        /// </summary>
+        private bool UpdateCustomRobotFallback()
+        {
+            var es = EventSystem.current;
+            if ((object)es == null) return false;
+            var selectedGO = es.currentSelectedGameObject;
+            if ((object)selectedGO == null || selectedGO.Pointer == IntPtr.Zero)
+                return false;
+
+            IntPtr selectedPtr = selectedGO.Pointer;
+            if (selectedPtr == _lastSelectedButtonPtr)
+                return false;
+
+            _lastSelectedButtonPtr = selectedPtr;
+            _stalePollCount = 0;
+
+            string text = ReadAllVisibleText();
+            if (!string.IsNullOrWhiteSpace(text))
+            {
+                ScreenReaderOutput.Say(text);
+                DebugHelper.Write($"GenericMenu: [CustomRobot] fallback");
+            }
+
+            return false;
+        }
+
+        /// <summary>
+        /// Special update path for PilotTrainingUIHandler.
+        /// This handler uses sub-handler cursors (statusHandler.m_CurrentIndex for
+        /// Skill tab, paramHandler.m_CurrentIndex for Param tab) instead of
+        /// UIHandlerBase.currentCursorIndex. Multiple PilotTrainingListUIHandler
+        /// children exist; we switch _listHandler based on currentSelectType.
+        /// </summary>
+        private bool UpdatePilotTrainingHandler()
+        {
+            if (_newHandlerJustFound)
+            {
+                _newHandlerJustFound = false;
+                _lastTrainingMenuType = -2;
+                _lastTrainingSelectType = -1;
+                _lastTrainingCursorIndex = -1;
+                string screenKey = "screen_" + _activeHandlerType.ToLowerInvariant();
+                string screenName = Loc.Get(screenKey);
+                if (screenName != screenKey)
+                    ScreenReaderOutput.Say(screenName);
+                DebugHelper.Write($"GenericMenu: [{_activeHandlerType}] pilot training init");
+            }
+
+            try
+            {
+                var handler = _activeHandler.TryCast<PilotTrainingUIHandler>();
+                if ((object)handler == null) return false;
+
+                // Detect tab change (Skill=0 vs Param=1)
+                int menuType = (int)handler.currentMenuType;
+                bool tabChanged = (menuType != _lastTrainingMenuType);
+
+                if (tabChanged)
+                {
+                    _lastTrainingMenuType = menuType;
+                    _lastTrainingCursorIndex = -1;
+                    _lastTrainingSelectType = -1;
+                    _listHandler = null;
+
+                    string tabName = menuType switch
+                    {
+                        0 => Loc.Get("training_tab_skill"),
+                        1 => Loc.Get("training_tab_param"),
+                        _ => null
+                    };
+                    if (!string.IsNullOrWhiteSpace(tabName))
+                        ScreenReaderOutput.Say(tabName);
+
+                    DebugHelper.Write($"GenericMenu: PilotTraining tab changed to {menuType}");
+                }
+
+                int cursor;
+
+                if (menuType == 0) // Skill tab
+                {
+                    var sh = handler.statusHandler;
+                    if ((object)sh == null) return false;
+
+                    int selectType = (int)sh.currentSelectType;
+                    if (selectType != _lastTrainingSelectType || tabChanged)
+                    {
+                        _lastTrainingSelectType = selectType;
+                        _lastTrainingCursorIndex = -1;
+                        // Switch to the correct list handler for this sub-list
+                        UpdateSkillTabListHandler(sh, selectType);
+                    }
+
+                    cursor = sh.m_CurrentIndex;
+                }
+                else if (menuType == 1) // Param tab
+                {
+                    var ph = handler.paramHandler;
+                    if ((object)ph == null) return false;
+                    cursor = ph.m_CurrentIndex;
+                }
+                else
+                {
+                    return false; // Unknown tab
+                }
+
+                if (cursor == _lastTrainingCursorIndex)
+                    return false;
+
+                _lastTrainingCursorIndex = cursor;
+                _stalePollCount = 0;
+
+                // Read item text
+                string text = null;
+
+                if ((object)_listHandler != null)
+                    text = ReadListItemText(cursor);
+
+                if (string.IsNullOrWhiteSpace(text))
+                    text = ReadGenericButtonText(cursor);
+
+                if (!string.IsNullOrWhiteSpace(text))
+                {
+                    ScreenReaderOutput.Say(text);
+                    _descriptionDelay = 3;
+                    _descriptionRetries = 0;
+                    DebugHelper.Write($"GenericMenu: [PilotTraining] tab={menuType} cursor={cursor} text={text}");
+                }
+                else
+                {
+                    DebugHelper.Write($"GenericMenu: [PilotTraining] tab={menuType} cursor={cursor} no text found");
+                }
+            }
+            catch (Exception ex)
+            {
+                DebugHelper.Write($"GenericMenu: PilotTraining error: {ex.GetType().Name}: {ex.Message}");
+            }
+
+            if (_faultCount > 0) _faultCount = 0;
+            return false;
+        }
+
+        /// <summary>
+        /// Special update handler for StatusUIHandler.
+        /// Tracks tab changes (Pilot/Robot/Weapon) and reads weapon list items
+        /// when on the Weapon tab. For Pilot/Robot tabs, reads all visible TMP.
+        /// </summary>
+        private bool UpdateStatusUIHandler()
+        {
+            bool justFound = false;
+            if (_newHandlerJustFound)
+            {
+                _newHandlerJustFound = false;
+                justFound = true;
+                string screenName = Loc.Get("screen_statusuihandler");
+                if (screenName != "screen_statusuihandler")
+                    ScreenReaderOutput.Say(screenName);
+            }
+
+            try
+            {
+                var statusHandler = _activeHandler.TryCast<StatusUIHandler>();
+                if ((object)statusHandler == null) return false;
+
+                int uiType = (int)statusHandler.currentUIType;
+
+                // Detect tab change
+                bool tabChanged = (uiType != _lastStatusUIType);
+                if (tabChanged)
+                {
+                    _lastStatusUIType = uiType;
+                    _lastCursorIndex = -1;
+                    _stalePollCount = 0;
+
+                    // Announce tab name
+                    string tabKey = uiType switch
+                    {
+                        0 => "status_tab_pilot",
+                        1 => "status_tab_robot",
+                        2 => "status_tab_weapon",
+                        _ => null
+                    };
+                    if (tabKey != null)
+                    {
+                        string tabName = Loc.Get(tabKey);
+                        if (tabName != tabKey)
+                            ScreenReaderOutput.Say(tabName);
+                    }
+
+                    DebugHelper.Write($"GenericMenu: [StatusUIHandler] tab={uiType}");
+
+                    // For non-weapon tabs, read structured info
+                    if (uiType == 0)
+                    {
+                        string pilotInfo = ReadStatusPilotInfo(statusHandler);
+                        if (!string.IsNullOrWhiteSpace(pilotInfo))
+                            ScreenReaderOutput.SayQueued(pilotInfo);
+                        return false;
+                    }
+                    else if (uiType == 1)
+                    {
+                        string robotInfo = ReadStatusRobotInfo(statusHandler);
+                        if (!string.IsNullOrWhiteSpace(robotInfo))
+                            ScreenReaderOutput.SayQueued(robotInfo);
+                        return false;
+                    }
+                }
+
+                // Weapon tab: track cursor and read weapon item details
+                if (uiType == 2)
+                {
+                    int currentIndex;
+                    if (SafeCall.FieldsAvailable)
+                    {
+                        var (ok, idx) = SafeCall.ReadCursorIndexSafe(_activeHandler.Pointer);
+                        if (!ok) { ReleaseHandler(); return true; }
+                        currentIndex = idx;
+                    }
+                    else
+                    {
+                        try { currentIndex = _activeHandler.currentCursorIndex; }
+                        catch { ReleaseHandler(); return true; }
+                    }
+
+                    if (currentIndex != _lastCursorIndex || justFound)
+                    {
+                        _lastCursorIndex = currentIndex;
+                        _stalePollCount = 0;
+
+                        string weaponText = ReadStatusWeaponItem(statusHandler, currentIndex);
+                        if (!string.IsNullOrWhiteSpace(weaponText))
+                            ScreenReaderOutput.Say(weaponText);
+                        else
+                            DebugHelper.Write($"GenericMenu: [StatusUIHandler] weapon cursor={currentIndex} no text");
+                    }
+                    else
+                    {
+                        _stalePollCount++;
+                    }
+                }
+                else
+                {
+                    // PILOT/ROBOT: no continuous cursor tracking needed
+                    _stalePollCount++;
+                }
+            }
+            catch (Exception ex)
+            {
+                DebugHelper.Write($"GenericMenu: [StatusUIHandler] error: {ex.Message}");
+            }
+
+            if (_faultCount > 0) _faultCount = 0;
+            return false;
+        }
+
+        /// <summary>
+        /// Read weapon details from StatusUIWeaponListItemHandler at the given index.
+        /// Returns formatted text with name, attack, range, EN, ammo, crit, hit.
+        /// </summary>
+        private string ReadStatusWeaponItem(StatusUIHandler statusHandler, int index)
+        {
+            try
+            {
+                var weaponUI = statusHandler.weaponUIHandler;
+                if ((object)weaponUI == null) return null;
+
+                var listUI = weaponUI.listUIHandler;
+                if ((object)listUI == null || listUI.Pointer == IntPtr.Zero) return null;
+
+                if (!SafeCall.ProbeObject(listUI.Pointer)) return null;
+
+                var items = listUI.m_ListItem;
+                if ((object)items == null || items.Count == 0) return null;
+
+                ListItemHandler rawItem = null;
+                if (index >= 0 && index < items.Count)
+                    rawItem = items[index];
+                else if (items.Count > 0)
+                    rawItem = items[((index % items.Count) + items.Count) % items.Count];
+
+                if ((object)rawItem == null || rawItem.Pointer == IntPtr.Zero) return null;
+
+                var weaponItem = rawItem.TryCast<StatusUIWeaponListItemHandler>();
+                if ((object)weaponItem == null) return null;
+
+                var parts = new System.Collections.Generic.List<string>();
+
+                // Weapon name
+                try
+                {
+                    string name = ReadTmpSafe(weaponItem.m_NameText);
+                    if (!string.IsNullOrWhiteSpace(name))
+                        parts.Add(TextUtils.CleanRichText(name));
+                }
+                catch { }
+
+                // Attack power
+                try
+                {
+                    string attack = ReadTmpSafe(weaponItem.m_AttackText);
+                    if (!string.IsNullOrWhiteSpace(attack))
+                        parts.Add(Loc.Get("weapon_power") + " " + attack);
+                }
+                catch { }
+
+                // Range (min~max)
+                try
+                {
+                    var rt = weaponItem.rangeText;
+                    if ((object)rt != null && rt.Pointer != IntPtr.Zero)
+                    {
+                        string rMin = ReadTmpSafe(rt.rangeMinText);
+                        string rMax = ReadTmpSafe(rt.rangeMaxText);
+                        if (!string.IsNullOrWhiteSpace(rMin))
+                        {
+                            string rangeStr = rMin;
+                            if (!string.IsNullOrWhiteSpace(rMax) && rMax != rMin)
+                                rangeStr += "~" + rMax;
+                            parts.Add(Loc.Get("weapon_range") + " " + rangeStr);
+                        }
+                    }
+                }
+                catch { }
+
+                // EN cost
+                try
+                {
+                    string en = ReadTmpSafe(weaponItem.m_ENText);
+                    if (!string.IsNullOrWhiteSpace(en))
+                        parts.Add(Loc.Get("weapon_en_cost") + " " + en);
+                }
+                catch { }
+
+                // Ammo
+                try
+                {
+                    string ammo = ReadTmpSafe(weaponItem.m_AmmoText);
+                    if (!string.IsNullOrWhiteSpace(ammo) && ammo != "-")
+                        parts.Add(Loc.Get("weapon_ammo") + " " + ammo);
+                }
+                catch { }
+
+                // Critical rate
+                try
+                {
+                    string crit = ReadTmpSafe(weaponItem.m_CriticalText);
+                    if (!string.IsNullOrWhiteSpace(crit))
+                        parts.Add(Loc.Get("weapon_crit") + " " + crit);
+                }
+                catch { }
+
+                // Hit rate
+                try
+                {
+                    string hit = ReadTmpSafe(weaponItem.m_HitText);
+                    if (!string.IsNullOrWhiteSpace(hit))
+                        parts.Add(Loc.Get("battle_hit_rate") + " " + hit);
+                }
+                catch { }
+
+                return parts.Count > 0 ? string.Join(", ", parts) : null;
+            }
+            catch { return null; }
+        }
+
+        /// <summary>
+        /// Read structured pilot info from StatusUIHandler's pilot tab.
+        /// Returns formatted text with name, level, SP, morale, stats, skills, spirits.
+        /// </summary>
+        private string ReadStatusPilotInfo(StatusUIHandler statusHandler)
+        {
+            try
+            {
+                var pilotUI = statusHandler.pilotUIHandler;
+                if ((object)pilotUI == null) return null;
+
+                var parts = new System.Collections.Generic.List<string>();
+
+                // Base info
+                try
+                {
+                    var baseInfo = pilotUI.baseInfoUIHandler;
+                    if ((object)baseInfo != null)
+                    {
+                        string name = ReadTmpSafe(baseInfo.m_NameText);
+                        if (!string.IsNullOrWhiteSpace(name))
+                            parts.Add(TextUtils.CleanRichText(name));
+
+                        string level = ReadTmpSafe(baseInfo.m_LevelText);
+                        if (!string.IsNullOrWhiteSpace(level))
+                            parts.Add("Lv " + level);
+
+                        string sp = ReadTmpSafe(baseInfo.m_SPText);
+                        string maxSp = ReadTmpSafe(baseInfo.m_MaxSPText);
+                        if (!string.IsNullOrWhiteSpace(sp))
+                            parts.Add("SP " + sp + (string.IsNullOrWhiteSpace(maxSp) ? "" : "/" + maxSp));
+
+                        string morale = ReadTmpSafe(baseInfo.m_MoraleText);
+                        string maxMorale = ReadTmpSafe(baseInfo.m_MaxMoraleText);
+                        if (!string.IsNullOrWhiteSpace(morale))
+                            parts.Add(Loc.Get("stat_morale") + " " + morale + (string.IsNullOrWhiteSpace(maxMorale) ? "" : "/" + maxMorale));
+
+                        string score = ReadTmpSafe(baseInfo.m_ScoreText);
+                        if (!string.IsNullOrWhiteSpace(score))
+                            parts.Add(Loc.Get("stat_score") + " " + score);
+                    }
+                }
+                catch { }
+
+                // Pilot stats (melee, defend, evade, skill, hit, sight)
+                try
+                {
+                    var statUI = pilotUI.statusUIHandelr; // typo in game code
+                    if ((object)statUI != null)
+                    {
+                        ReadParamGroupText(parts, statUI.meleeParamGroup, "stat_melee");
+                        ReadParamGroupText(parts, statUI.defendParamGroup, "stat_defend");
+                        ReadParamGroupText(parts, statUI.evadeParamGroup, "stat_evade");
+                        ReadParamGroupText(parts, statUI.skillParamGroup, "stat_skill");
+                        ReadParamGroupText(parts, statUI.hitParamGroup, "stat_hit");
+                        ReadParamGroupText(parts, statUI.rangeParamGroup, "stat_sight");
+                    }
+                }
+                catch { }
+
+                // Ace bonus
+                try
+                {
+                    var aceUI = pilotUI.aceBonusUIHandler;
+                    if ((object)aceUI != null)
+                    {
+                        string bonus = ReadTmpSafe(aceUI.m_BonusText);
+                        if (!string.IsNullOrWhiteSpace(bonus))
+                            parts.Add(Loc.Get("stat_ace_bonus") + ": " + TextUtils.CleanRichText(bonus));
+                    }
+                }
+                catch { }
+
+                // Special skills (names from UI, descriptions from SAInterface data)
+                try
+                {
+                    var skillUI = pilotUI.specialSkillUIHandler;
+                    if ((object)skillUI != null)
+                    {
+                        var skillItems = skillUI.m_ItemList;
+                        if ((object)skillItems != null && skillItems.Count > 0)
+                        {
+                            // Try to get SAInterface skill list for descriptions
+                            Il2CppSystem.Collections.Generic.List<Il2CppCom.BBStudio.SRTeam.Data.SAInterface> saSkills = null;
+                            try
+                            {
+                                var unitData = statusHandler.unit;
+                                if ((object)unitData != null)
+                                {
+                                    var pilot = unitData.pilot;
+                                    if ((object)pilot != null)
+                                        saSkills = pilot.GetSkills();
+                                }
+                            }
+                            catch { }
+
+                            var skillEntries = new System.Collections.Generic.List<string>();
+                            for (int i = 0; i < skillItems.Count && i < 20; i++)
+                            {
+                                try
+                                {
+                                    var item = skillItems[i];
+                                    if ((object)item == null) continue;
+                                    string sn = ReadTmpSafe(item.m_NameText);
+                                    if (string.IsNullOrWhiteSpace(sn)) continue;
+                                    sn = TextUtils.CleanRichText(sn);
+
+                                    // Try to get description from SAInterface
+                                    string desc = null;
+                                    if ((object)saSkills != null && i < saSkills.Count)
+                                    {
+                                        try
+                                        {
+                                            var sa = saSkills[i];
+                                            if ((object)sa != null)
+                                                desc = sa.GetDescription();
+                                        }
+                                        catch { }
+                                    }
+
+                                    if (!string.IsNullOrWhiteSpace(desc))
+                                        skillEntries.Add(sn + ": " + desc);
+                                    else
+                                        skillEntries.Add(sn);
+                                }
+                                catch { }
+                            }
+                            if (skillEntries.Count > 0)
+                                parts.Add(Loc.Get("stat_pilot_skills") + ": " + string.Join(". ", skillEntries));
+                        }
+                    }
+                }
+                catch { }
+
+                // Spirit commands
+                try
+                {
+                    var spiritUI = pilotUI.spiritCommandUIHandler;
+                    if ((object)spiritUI != null)
+                    {
+                        var spiritItems = spiritUI.m_ItemList;
+                        if ((object)spiritItems != null && spiritItems.Count > 0)
+                        {
+                            var spiritNames = new System.Collections.Generic.List<string>();
+                            for (int i = 0; i < spiritItems.Count && i < 10; i++)
+                            {
+                                try
+                                {
+                                    var item = spiritItems[i];
+                                    if ((object)item == null) continue;
+                                    string sn = ReadTmpSafe(item.m_NameText);
+                                    string cost = ReadTmpSafe(item.m_CostText);
+                                    if (!string.IsNullOrWhiteSpace(sn))
+                                    {
+                                        string entry = TextUtils.CleanRichText(sn);
+                                        if (!string.IsNullOrWhiteSpace(cost))
+                                            entry += "(" + cost + ")";
+                                        spiritNames.Add(entry);
+                                    }
+                                }
+                                catch { }
+                            }
+                            if (spiritNames.Count > 0)
+                                parts.Add(Loc.Get("stat_spirit_commands") + ": " + string.Join(", ", spiritNames));
+                        }
+                    }
+                }
+                catch { }
+
+                return parts.Count > 0 ? string.Join(". ", parts) : null;
+            }
+            catch { return null; }
+        }
+
+        /// <summary>
+        /// Read structured robot info from StatusUIHandler's robot tab.
+        /// Returns formatted text with name, size, HP, EN, move, stats, terrain, abilities, parts.
+        /// </summary>
+        private string ReadStatusRobotInfo(StatusUIHandler statusHandler)
+        {
+            try
+            {
+                var robotUI = statusHandler.robotUIHandler;
+                if ((object)robotUI == null) return null;
+
+                var parts = new System.Collections.Generic.List<string>();
+
+                // Base info
+                try
+                {
+                    var baseInfo = robotUI.baseInfoUIHandler;
+                    if ((object)baseInfo != null)
+                    {
+                        string name = ReadTmpSafe(baseInfo.nameText);
+                        if (!string.IsNullOrWhiteSpace(name))
+                            parts.Add(TextUtils.CleanRichText(name));
+
+                        string size = ReadTmpSafe(baseInfo.sizeText);
+                        if (!string.IsNullOrWhiteSpace(size))
+                            parts.Add(Loc.Get("stat_size") + " " + size);
+
+                        string move = ReadTmpSafe(baseInfo.moveRangeText);
+                        if (!string.IsNullOrWhiteSpace(move))
+                            parts.Add(Loc.Get("stat_move") + " " + move);
+
+                        // HP gauge
+                        try
+                        {
+                            var hpGauge = baseInfo.hpGauge;
+                            if ((object)hpGauge != null)
+                            {
+                                string hp = ReadTmpSafe(hpGauge.m_CurrentParamText);
+                                string maxHp = ReadTmpSafe(hpGauge.m_MaxParamText);
+                                if (!string.IsNullOrWhiteSpace(hp))
+                                    parts.Add("HP " + hp + (string.IsNullOrWhiteSpace(maxHp) ? "" : "/" + maxHp));
+                            }
+                        }
+                        catch { }
+
+                        // EN gauge
+                        try
+                        {
+                            var enGauge = baseInfo.enGauge;
+                            if ((object)enGauge != null)
+                            {
+                                string en = ReadTmpSafe(enGauge.m_CurrentParamText);
+                                string maxEn = ReadTmpSafe(enGauge.m_MaxParamText);
+                                if (!string.IsNullOrWhiteSpace(en))
+                                    parts.Add("EN " + en + (string.IsNullOrWhiteSpace(maxEn) ? "" : "/" + maxEn));
+                            }
+                        }
+                        catch { }
+                    }
+                }
+                catch { }
+
+                // Robot stats (armor, mobility, accuracy) + remodel
+                try
+                {
+                    var statUI = robotUI.statusUIHandelr; // typo in game code
+                    if ((object)statUI != null)
+                    {
+                        ReadRobotParamGroupText(parts, statUI.armorHardnessParamGroup, "stat_armor");
+                        ReadRobotParamGroupText(parts, statUI.quickMovementParamGroup, "stat_mobility");
+                        ReadRobotParamGroupText(parts, statUI.aimingAbilityParamGroup, "stat_accuracy");
+
+                        string remodel = ReadTmpSafe(statUI.remodelingText);
+                        if (!string.IsNullOrWhiteSpace(remodel))
+                            parts.Add(Loc.Get("stat_upgrade_levels") + " " + remodel);
+
+                        // Terrain adaptation
+                        try
+                        {
+                            var adaptUI = statUI.adaptationUIHandler;
+                            if ((object)adaptUI != null)
+                            {
+                                var terrainParts = new System.Collections.Generic.List<string>();
+                                AppendTerrainRank(terrainParts, adaptUI.airLevelTextGroup, "terrain_sky");
+                                AppendTerrainRank(terrainParts, adaptUI.landLevelTextGroup, "terrain_ground");
+                                AppendTerrainRank(terrainParts, adaptUI.waterLevelTextGroup, "terrain_water");
+                                AppendTerrainRank(terrainParts, adaptUI.spaceLevelTextGroup, "terrain_space");
+                                if (terrainParts.Count > 0)
+                                    parts.Add(Loc.Get("stat_terrain") + " " + string.Join(" ", terrainParts));
+                            }
+                        }
+                        catch { }
+                    }
+                }
+                catch { }
+
+                // Robot abilities (names from UI, descriptions from SAInterface data)
+                try
+                {
+                    var skillUI = robotUI.skillUIHandler;
+                    if ((object)skillUI != null)
+                    {
+                        var abilityItems = skillUI.m_ItemList;
+                        if ((object)abilityItems != null && abilityItems.Count > 0)
+                        {
+                            // Try to get SAInterface skill list for descriptions
+                            Il2CppSystem.Collections.Generic.List<Il2CppCom.BBStudio.SRTeam.Data.SAInterface> saSkills = null;
+                            try
+                            {
+                                var unitData = statusHandler.unit;
+                                if ((object)unitData != null)
+                                {
+                                    var robot = unitData.robot;
+                                    if ((object)robot != null)
+                                        saSkills = robot.GetSkills();
+                                }
+                            }
+                            catch { }
+
+                            var abilityEntries = new System.Collections.Generic.List<string>();
+                            for (int i = 0; i < abilityItems.Count && i < 20; i++)
+                            {
+                                try
+                                {
+                                    var item = abilityItems[i];
+                                    if ((object)item == null) continue;
+                                    string an = ReadTmpSafe(item.m_NameText);
+                                    if (string.IsNullOrWhiteSpace(an)) continue;
+                                    an = TextUtils.CleanRichText(an);
+
+                                    // Try to get description from SAInterface
+                                    string desc = null;
+                                    if ((object)saSkills != null && i < saSkills.Count)
+                                    {
+                                        try
+                                        {
+                                            var sa = saSkills[i];
+                                            if ((object)sa != null)
+                                                desc = sa.GetDescription();
+                                        }
+                                        catch { }
+                                    }
+
+                                    if (!string.IsNullOrWhiteSpace(desc))
+                                        abilityEntries.Add(an + ": " + desc);
+                                    else
+                                        abilityEntries.Add(an);
+                                }
+                                catch { }
+                            }
+                            if (abilityEntries.Count > 0)
+                                parts.Add(Loc.Get("stat_robot_skills") + ": " + string.Join(". ", abilityEntries));
+                        }
+                    }
+                }
+                catch { }
+
+                // Equipped parts (names from UI, descriptions from SAInterface data)
+                try
+                {
+                    var partsUI = robotUI.partsUIHandler;
+                    if ((object)partsUI != null)
+                    {
+                        var partsList = partsUI.m_PartsList;
+                        if ((object)partsList != null && partsList.Count > 0)
+                        {
+                            // Try to get SAInterface power parts list for descriptions
+                            Il2CppSystem.Collections.Generic.List<Il2CppCom.BBStudio.SRTeam.Data.SAInterface> saParts = null;
+                            try
+                            {
+                                var unitData = statusHandler.unit;
+                                if ((object)unitData != null)
+                                {
+                                    var robot = unitData.robot;
+                                    if ((object)robot != null)
+                                        saParts = robot.GetPowerParts();
+                                }
+                            }
+                            catch { }
+
+                            var partEntries = new System.Collections.Generic.List<string>();
+                            for (int i = 0; i < partsList.Count && i < 10; i++)
+                            {
+                                try
+                                {
+                                    var item = partsList[i];
+                                    if ((object)item == null) continue;
+                                    string pn = ReadTmpSafe(item.m_PartsName);
+                                    if (string.IsNullOrWhiteSpace(pn)) continue;
+                                    pn = TextUtils.CleanRichText(pn);
+
+                                    // Try to get description from SAInterface
+                                    string desc = null;
+                                    if ((object)saParts != null && i < saParts.Count)
+                                    {
+                                        try
+                                        {
+                                            var sa = saParts[i];
+                                            if ((object)sa != null)
+                                                desc = sa.GetDescription();
+                                        }
+                                        catch { }
+                                    }
+
+                                    if (!string.IsNullOrWhiteSpace(desc))
+                                        partEntries.Add(pn + ": " + desc);
+                                    else
+                                        partEntries.Add(pn);
+                                }
+                                catch { }
+                            }
+                            if (partEntries.Count > 0)
+                                parts.Add(Loc.Get("stat_power_parts") + ": " + string.Join(". ", partEntries));
+                        }
+                    }
+                }
+                catch { }
+
+                return parts.Count > 0 ? string.Join(". ", parts) : null;
+            }
+            catch { return null; }
+        }
+
+        /// <summary>
+        /// Read a pilot ParamTextGroup's ParamText TMP value and append to parts list.
+        /// Pilot version uses uppercase ParamText.
+        /// </summary>
+        private void ReadParamGroupText(System.Collections.Generic.List<string> parts,
+            StatusUIPilotStatusUIHandler.ParamTextGroup group, string locKey)
+        {
+            try
+            {
+                var tmp = group.ParamText;
+                if ((object)tmp == null) return;
+                string val = ReadTmpSafe(tmp);
+                if (!string.IsNullOrWhiteSpace(val))
+                    parts.Add(Loc.Get(locKey) + " " + val);
+            }
+            catch { }
+        }
+
+        /// <summary>
+        /// Read a robot ParamTextGroup's paramText TMP value and append to parts list.
+        /// Robot version uses lowercase paramText.
+        /// </summary>
+        private void ReadRobotParamGroupText(System.Collections.Generic.List<string> parts,
+            StatusUIRobotStatusUIHandler.ParamTextGroup group, string locKey)
+        {
+            try
+            {
+                var tmp = group.paramText;
+                if ((object)tmp == null) return;
+                string val = ReadTmpSafe(tmp);
+                if (!string.IsNullOrWhiteSpace(val))
+                    parts.Add(Loc.Get(locKey) + " " + val);
+            }
+            catch { }
+        }
+
+        /// <summary>
+        /// Read terrain adaptation rank from AdaptationUIHandler ParamTextGroup
+        /// and append "label:rank" to the list.
+        /// </summary>
+        private void AppendTerrainRank(System.Collections.Generic.List<string> parts,
+            AdaptationUIHandler.ParamTextGroup group, string locKey)
+        {
+            try
+            {
+                var tmp = group.ParamText;
+                if ((object)tmp == null) return;
+                string rank = ReadTmpSafe(tmp);
+                if (!string.IsNullOrWhiteSpace(rank))
+                    parts.Add(Loc.Get(locKey) + rank);
+            }
+            catch { }
+        }
+
+        /// <summary>
+        /// Switch _listHandler to the correct PilotTrainingListUIHandler for the
+        /// current skill sub-list type (SkillList, SkillProgramList, SkillProgramLevelList).
+        /// </summary>
+        private void UpdateSkillTabListHandler(PilotTrainingStatusHandler sh, int selectType)
+        {
+            _listHandler = null;
+            try
+            {
+                PilotTrainingListUIHandler targetList = null;
+                switch (selectType)
+                {
+                    case 0: // SkillList
+                        targetList = sh.skillListHandler;
+                        break;
+                    case 1: // SkillProgramList
+                        targetList = sh.skillProgramListHandler;
+                        break;
+                    case 2: // SkillProgramLevelList
+                        try
+                        {
+                            var levelList = sh.pilotSkillLevelList;
+                            if ((object)levelList != null)
+                                targetList = levelList.skillProgramLevelList;
+                        }
+                        catch { }
+                        break;
+                }
+
+                if ((object)targetList != null && targetList.Pointer != IntPtr.Zero
+                    && SafeCall.ProbeObject(targetList.Pointer))
+                {
+                    _listHandler = targetList;
+                    DebugHelper.Write($"GenericMenu: PilotTraining list handler set: selectType={selectType}");
+                }
+            }
+            catch { }
+        }
+
+        /// <summary>
         /// Read part name and counts from a PartsEquipPartsPossessionColumn list item.
         /// Returns formatted text: "partName remainCount/totalCount"
         /// </summary>
@@ -857,6 +2804,12 @@ namespace SRWYAccess
             try
             {
                 if ((object)_listHandler == null || _listHandler.Pointer == IntPtr.Zero)
+                {
+                    _listHandler = null;
+                    return null;
+                }
+
+                if (!SafeCall.ProbeObject(_listHandler.Pointer))
                 {
                     _listHandler = null;
                     return null;
@@ -887,7 +2840,7 @@ namespace SRWYAccess
                     {
                         var nameTmp = partsCol.m_PartsName;
                         if ((object)nameTmp != null)
-                            name = TextUtils.CleanRichText(nameTmp.text);
+                            name = ReadTmpSafe(nameTmp);
                     }
                     catch { }
 
@@ -895,7 +2848,10 @@ namespace SRWYAccess
                     {
                         var remainTmp = partsCol.m_PartsRemainCnt;
                         if ((object)remainTmp != null)
-                            remain = remainTmp.text?.Trim();
+                        {
+                            string t = ReadTmpSafe(remainTmp);
+                            if (t != null) remain = t.Trim();
+                        }
                     }
                     catch { }
 
@@ -903,7 +2859,10 @@ namespace SRWYAccess
                     {
                         var totalTmp = partsCol.m_PartsTotalCnt;
                         if ((object)totalTmp != null)
-                            total = totalTmp.text?.Trim();
+                        {
+                            string t = ReadTmpSafe(totalTmp);
+                            if (t != null) total = t.Trim();
+                        }
                     }
                     catch { }
 
@@ -921,6 +2880,168 @@ namespace SRWYAccess
             catch
             {
                 _listHandler = null;
+                return null;
+            }
+        }
+
+        /// <summary>
+        /// Read save/load slot info from SaveLoadListItemHandler.
+        /// Reads structured fields: nameText (slot name), allText.AutoManual,
+        /// allText.ChapterNo, allText.PlayTime, allText.TurnCount, allText.SubtitleCaption.
+        /// Returns formatted: "DATA 01: Auto Save, Chapter 5, Turn 23, Playtime 12h34m"
+        /// </summary>
+        private string ReadSaveLoadItemText(int cursorIndex)
+        {
+            try
+            {
+                if ((object)_listHandler == null || _listHandler.Pointer == IntPtr.Zero)
+                {
+                    _listHandler = null;
+                    return null;
+                }
+
+                if (!SafeCall.ProbeObject(_listHandler.Pointer))
+                {
+                    _listHandler = null;
+                    return null;
+                }
+
+                var items = _listHandler.m_ListItem;
+                if ((object)items == null) return null;
+                int itemCount = items.Count;
+                if (itemCount == 0) return null;
+
+                ListItemHandler item = null;
+                if (cursorIndex >= 0 && cursorIndex < itemCount)
+                    item = items[cursorIndex];
+                else if (itemCount > 0)
+                    item = items[((cursorIndex % itemCount) + itemCount) % itemCount];
+
+                if ((object)item == null || item.Pointer == IntPtr.Zero) return null;
+
+                var saveItem = item.TryCast<SaveLoadListItemHandler>();
+                if ((object)saveItem == null || saveItem.Pointer == IntPtr.Zero)
+                    return null;
+
+                var parts = new System.Collections.Generic.List<string>();
+
+                // Slot name (e.g. "DATA 01")
+                try
+                {
+                    var nameTmp = saveItem.nameText;
+                    if ((object)nameTmp != null)
+                    {
+                        string name = ReadTmpSafe(nameTmp);
+                        if (!string.IsNullOrWhiteSpace(name))
+                            parts.Add(name);
+                    }
+                }
+                catch { }
+
+                // Access DisplayStrings struct for structured data
+                try
+                {
+                    var ds = saveItem.allText;
+                    if ((object)ds != null)
+                    {
+                        // Auto/Manual indicator
+                        try
+                        {
+                            var autoTmp = ds.AutoManual;
+                            if ((object)autoTmp != null)
+                            {
+                                string auto = ReadTmpSafe(autoTmp);
+                                if (!string.IsNullOrWhiteSpace(auto))
+                                    parts.Add(auto);
+                            }
+                        }
+                        catch { }
+
+                        // Chapter number
+                        try
+                        {
+                            var chapterTmp = ds.ChapterNo;
+                            if ((object)chapterTmp != null)
+                            {
+                                string chapter = ReadTmpSafe(chapterTmp);
+                                if (!string.IsNullOrWhiteSpace(chapter))
+                                    parts.Add(Loc.Get("save_chapter", chapter));
+                            }
+                        }
+                        catch { }
+
+                        // Subtitle/mission name
+                        try
+                        {
+                            var subTmp = ds.SubtitleCaption;
+                            if ((object)subTmp != null)
+                            {
+                                string sub = ReadTmpSafe(subTmp);
+                                if (!string.IsNullOrWhiteSpace(sub))
+                                    parts.Add(sub);
+                            }
+                        }
+                        catch { }
+
+                        // Turn count
+                        try
+                        {
+                            var turnTmp = ds.TurnCount;
+                            if ((object)turnTmp != null)
+                            {
+                                string turn = ReadTmpSafe(turnTmp);
+                                if (!string.IsNullOrWhiteSpace(turn))
+                                    parts.Add(Loc.Get("save_turn", turn));
+                            }
+                        }
+                        catch { }
+
+                        // Playtime
+                        try
+                        {
+                            var playTmp = ds.PlayTime;
+                            if ((object)playTmp != null)
+                            {
+                                string play = ReadTmpSafe(playTmp);
+                                if (!string.IsNullOrWhiteSpace(play))
+                                    parts.Add(Loc.Get("save_playtime", play));
+                            }
+                        }
+                        catch { }
+
+                        // Save date
+                        try
+                        {
+                            var monthTmp = ds.SaveDateMonth;
+                            var timeTmp = ds.SaveDateTime;
+                            string month = null, time = null;
+                            if ((object)monthTmp != null)
+                                month = ReadTmpSafe(monthTmp);
+                            if ((object)timeTmp != null)
+                                time = ReadTmpSafe(timeTmp);
+                            if (!string.IsNullOrWhiteSpace(month))
+                            {
+                                string dateStr = month;
+                                if (!string.IsNullOrWhiteSpace(time))
+                                    dateStr += " " + time;
+                                parts.Add(dateStr);
+                            }
+                        }
+                        catch { }
+                    }
+                }
+                catch { }
+
+                if (parts.Count == 0)
+                {
+                    // Empty slot
+                    return Loc.Get("save_new_slot");
+                }
+
+                return string.Join(", ", parts);
+            }
+            catch
+            {
                 return null;
             }
         }
@@ -1077,23 +3198,36 @@ namespace SRWYAccess
 
             if ((object)inputMgr == null) return false;
 
-            IInputBehaviour currentBehaviour;
-            try
-            {
-                if (inputMgr.Pointer == IntPtr.Zero) return false;
-                currentBehaviour = inputMgr.GetCurrentInputBehaviour();
-            }
-            catch { return false; }
-
-            if ((object)currentBehaviour == null) return false;
-
             IntPtr currentBehaviourPtr;
-            try
+            if (SafeCall.IsAvailable)
             {
-                currentBehaviourPtr = currentBehaviour.Pointer;
+                try
+                {
+                    if (inputMgr.Pointer == IntPtr.Zero) return false;
+                }
+                catch { return false; }
+
+                currentBehaviourPtr = SafeCall.GetCurrentInputBehaviourSafe(inputMgr.Pointer);
                 if (currentBehaviourPtr == IntPtr.Zero) return false;
             }
-            catch { return false; }
+            else
+            {
+                IInputBehaviour currentBehaviour;
+                try
+                {
+                    if (inputMgr.Pointer == IntPtr.Zero) return false;
+                    currentBehaviour = inputMgr.GetCurrentInputBehaviour();
+                }
+                catch { return false; }
+
+                if ((object)currentBehaviour == null) return false;
+                try
+                {
+                    currentBehaviourPtr = currentBehaviour.Pointer;
+                    if (currentBehaviourPtr == IntPtr.Zero) return false;
+                }
+                catch { return false; }
+            }
 
             // Fast-path: verify cached handler still matches.
             // SAFETY: Compare stored behaviour pointer (managed field) instead
@@ -1128,18 +3262,44 @@ namespace SRWYAccess
                 {
                     if (handler.Pointer == IntPtr.Zero) continue;
 
-                    var hGo = handler.gameObject;
-                    if ((object)hGo == null || hGo.Pointer == IntPtr.Zero) continue;
+                    // SEH probe: verify handler's native object is still alive
+                    // before calling any IL2CPP property.
+                    // During scene transitions (e.g. battle → adventure), handlers
+                    // returned by FindObjectsOfType may have freed native memory
+                    // → uncatchable AccessViolationException on property access.
+                    if (!SafeCall.ProbeObject(handler.Pointer)) continue;
 
-                    var cb = handler.controlBehaviour;
-                    if ((object)cb == null) continue;
-                    if (cb.Pointer == IntPtr.Zero) continue;
+                    // SAFETY: Read controlBehaviour via SEH-protected field read.
+                    // Do NOT access handler.gameObject here - it's an unprotected
+                    // IL2CPP method call that can AV on partially-destroyed objects.
+                    // Defer gameObject access until after match is confirmed.
+                    IntPtr cbPtr;
+                    if (SafeCall.FieldsAvailable)
+                    {
+                        cbPtr = SafeCall.ReadControlBehaviourPtrSafe(handler.Pointer);
+                        if (cbPtr == IntPtr.Zero) continue;
+                    }
+                    else
+                    {
+                        var cb = handler.controlBehaviour;
+                        if ((object)cb == null) continue;
+                        if (cb.Pointer == IntPtr.Zero) continue;
+                        cbPtr = cb.Pointer;
+                    }
 
-                    if (cb.Pointer == currentBehaviourPtr)
+                    if (cbPtr == currentBehaviourPtr)
                     {
                         string typeName;
-                        try { typeName = handler.GetIl2CppType().Name; }
-                        catch { typeName = "unknown"; }
+                        if (SafeCall.IsAvailable)
+                        {
+                            typeName = SafeCall.ReadObjectTypeName(handler.Pointer);
+                            if (typeName == null) continue; // handler freed between probe and read
+                        }
+                        else
+                        {
+                            try { typeName = handler.GetIl2CppType().Name; }
+                            catch { typeName = "unknown"; }
+                        }
 
                         if (_skipTypes.Contains(typeName)) continue;
 
@@ -1151,7 +3311,9 @@ namespace SRWYAccess
                             return true;
                         }
 
-                        // New handler found
+                        // New handler found - controlBehaviour matches, so
+                        // the handler is confirmed alive. Safe to access
+                        // gameObject now for ListHandlerBase detection.
                         _activeHandler = handler;
                         _lastHandlerPtr = handlerPtr;
                         _cachedBehaviourPtr = currentBehaviourPtr;
@@ -1159,19 +3321,40 @@ namespace SRWYAccess
                         _activeHandlerType = typeName;
                         _typeSpecificCount = -1;
                         _newHandlerJustFound = true;
+                        _initSkipCount = 3; // let UI settle before reading
                         _cmdDiagDumped = false;
 
-                        // Detect ListHandlerBase for list-based menus
+                        // Detect ListHandlerBase for menus
                         _listHandler = null;
-                        try
-                        {
-                            var lh = hGo.GetComponentInChildren<ListHandlerBase>(false);
-                            if ((object)lh != null && lh.Pointer != IntPtr.Zero)
-                                _listHandler = lh;
-                        }
-                        catch { }
 
-                        DebugHelper.Write($"GenericMenu: Found {_activeHandlerType}{((object)_listHandler != null ? " [list]" : "")}");
+                        // SAFETY: ProbeObject before accessing .gameObject to prevent AV
+                        // on partially-destroyed handlers during scene transitions.
+                        // If probe fails, skip detection (graceful degradation).
+                        if (SafeCall.ProbeObject(handler.Pointer))
+                        {
+                            try
+                            {
+                                var hGo = handler.gameObject;
+                                if ((object)hGo != null && hGo.Pointer != IntPtr.Zero)
+                                {
+                                    var lh = hGo.GetComponentInChildren<ListHandlerBase>(false);
+                                    if ((object)lh != null && lh.Pointer != IntPtr.Zero)
+                                        _listHandler = lh;
+                                }
+                            }
+                            catch { }
+                        }
+
+                        // Detect sort/filter TMP fields from list handler subtypes
+                        _sortTmp = null;
+                        _filterTmp = null;
+                        _lastSortText = "";
+                        _lastFilterText = "";
+                        if ((object)_listHandler != null)
+                            DetectSortFilterTmp();
+
+                        DebugHelper.Write($"GenericMenu: Found {_activeHandlerType}{((object)_listHandler != null ? " [list]" : "")}{((object)_sortTmp != null ? " [sort]" : "")}");
+                        DebugHelper.Flush();
                         return true;
                     }
                 }
@@ -1195,6 +3378,12 @@ namespace SRWYAccess
                 var mgr = InputManager.instance;
                 if ((object)mgr == null) return false;
                 if (mgr.Pointer == IntPtr.Zero) return false;
+
+                if (SafeCall.IsAvailable)
+                {
+                    IntPtr behPtr = SafeCall.GetCurrentInputBehaviourSafe(mgr.Pointer);
+                    return behPtr != IntPtr.Zero && behPtr == _cachedBehaviourPtr;
+                }
 
                 var beh = mgr.GetCurrentInputBehaviour();
                 if ((object)beh == null) return false;
@@ -1230,7 +3419,14 @@ namespace SRWYAccess
                 return;
             }
 
-            // Strategy 2: List-based reading
+            // Strategy 2a: Type-specific list reading (structured data)
+            if (string.IsNullOrWhiteSpace(text) && (object)_listHandler != null
+                && _activeHandlerType == "SaveLoadUIHandler")
+            {
+                text = ReadSaveLoadItemText(index);
+            }
+
+            // Strategy 2b: Generic list-based reading
             if (string.IsNullOrWhiteSpace(text) && (object)_listHandler != null)
             {
                 text = ReadListItemText(index);
@@ -1254,8 +3450,23 @@ namespace SRWYAccess
 
                 // Auto-read weapon detail info (hit/crit corrections, morale, skill)
                 // after the weapon name. Queued so weapon name is heard first.
+                // Weapon data comes from pre-populated list item fields (not updated
+                // on cursor change), so immediate read is safe.
                 if (_activeHandlerType == "WeaponListHandler")
                     AnnounceWeaponDetail();
+
+                // Defer description/detail reads by multiple poll cycles.
+                // The game updates TMP description text (explanationText,
+                // descriptionText, GuideUIHandler.m_GuideText) in UI handler
+                // Update/LateUpdate, which runs AFTER our hook in
+                // InputManager.Update(). Reading immediately gets stale text.
+                // Delay of 3 cycles (~100ms) gives the game reliable time.
+                // Rapid navigation resets the timer, reading only the final item.
+                // Applied to ALL handlers: specific readers run first, then
+                // generic GuideUIHandler.m_GuideText as universal fallback.
+                _descriptionDelay = 3;
+                _descriptionRetries = 0;
+                _descriptionCursorIndex = index;
             }
             else
             {
@@ -1347,25 +3558,38 @@ namespace SRWYAccess
         {
             if ((object)_activeHandler == null || index < 0) return null;
 
+            // Verify handler is still alive before unprotected .gameObject call
+            if (!SafeCall.ProbeObject(_activeHandler.Pointer)) return null;
+
             try
             {
                 var go = _activeHandler.gameObject;
                 if ((object)go == null || go.Pointer == IntPtr.Zero) return null;
 
-                var buttons = go.GetComponentsInChildren<Button>(false);
+                Il2CppInterop.Runtime.InteropTypes.Arrays.Il2CppArrayBase<Button> buttons = null;
+                try
+                {
+                    buttons = go.GetComponentsInChildren<Button>(false);
+                }
+                catch (Exception ex)
+                {
+                    DebugHelper.Write($"GMR: GetComponentsInChildren<Button> error: {ex.GetType().Name}");
+                    return null;
+                }
                 if (buttons == null || buttons.Count == 0 || index >= buttons.Count) return null;
 
                 var btn = buttons[index];
                 if ((object)btn == null) return null;
 
+                GameObject btnGo = null;
                 try
                 {
-                    var btnGo = btn.gameObject;
+                    btnGo = btn.gameObject;
                     if ((object)btnGo == null || !btnGo.activeInHierarchy) return null;
                 }
                 catch { return null; }
 
-                return ReadBestTmpText(btn.gameObject);
+                return ReadBestTmpText(btnGo);
             }
             catch { return null; }
         }
@@ -1378,23 +3602,45 @@ namespace SRWYAccess
         {
             try
             {
-                var tmps = go.GetComponentsInChildren<TextMeshProUGUI>(false);
+                Il2CppInterop.Runtime.InteropTypes.Arrays.Il2CppArrayBase<TextMeshProUGUI> tmps = null;
+                try
+                {
+                    tmps = go.GetComponentsInChildren<TextMeshProUGUI>(false);
+                }
+                catch (Exception ex)
+                {
+                    DebugHelper.Write($"GMR: GetComponentsInChildren<TMP> error: {ex.GetType().Name}");
+                    return null;
+                }
                 if (tmps == null || tmps.Count == 0) return null;
 
                 string bestText = null;
                 foreach (var tmp in tmps)
                 {
                     if ((object)tmp == null) continue;
-                    try
+
+                    // CRITICAL: Use SafeCall to read tmp.text - direct access causes
+                    // uncatchable AV when TMP object is destroyed during scene transitions
+                    string t = null;
+                    if (SafeCall.TmpTextMethodAvailable)
                     {
-                        string t = TextUtils.CleanRichText(tmp.text);
-                        if (!string.IsNullOrWhiteSpace(t) && !IsNumericOnly(t))
+                        IntPtr il2cppStrPtr = SafeCall.ReadTmpTextSafe(tmp.Pointer);
+                        if (il2cppStrPtr != IntPtr.Zero)
                         {
-                            if (bestText == null || t.Length > bestText.Length)
-                                bestText = t;
+                            try
+                            {
+                                t = IL2CPP.Il2CppStringToManaged(il2cppStrPtr);
+                                t = TextUtils.CleanRichText(t);
+                            }
+                            catch { }
                         }
                     }
-                    catch { }
+
+                    if (!string.IsNullOrWhiteSpace(t) && !IsNumericOnly(t))
+                    {
+                        if (bestText == null || t.Length > bestText.Length)
+                            bestText = t;
+                    }
                 }
 
                 return bestText;
@@ -1415,6 +3661,15 @@ namespace SRWYAccess
             try
             {
                 if ((object)_listHandler == null || _listHandler.Pointer == IntPtr.Zero)
+                {
+                    _listHandler = null;
+                    return null;
+                }
+
+                // SEH probe: verify ListHandlerBase native object is still alive
+                // before accessing m_ListItem. This IL2CPP field access dereferences
+                // native pointers and causes uncatchable AV if object was freed.
+                if (!SafeCall.ProbeObject(_listHandler.Pointer))
                 {
                     _listHandler = null;
                     return null;
@@ -1497,20 +3752,42 @@ namespace SRWYAccess
                         return null;
                 }
 
-                var tmps = targetGo.GetComponentsInChildren<TextMeshProUGUI>(false);
+                Il2CppInterop.Runtime.InteropTypes.Arrays.Il2CppArrayBase<TextMeshProUGUI> tmps = null;
+                try
+                {
+                    tmps = targetGo.GetComponentsInChildren<TextMeshProUGUI>(false);
+                }
+                catch (Exception ex)
+                {
+                    DebugHelper.Write($"GMR: ListItem GetComponentsInChildren error: {ex.GetType().Name}");
+                    return null;
+                }
                 if (tmps == null || tmps.Count == 0) return null;
 
                 var texts = new System.Collections.Generic.List<string>();
                 foreach (var tmp in tmps)
                 {
                     if ((object)tmp == null) continue;
-                    try
+
+                    // CRITICAL: Use SafeCall to read tmp.text - direct access causes
+                    // uncatchable AV when TMP object is destroyed during scene transitions
+                    string t = null;
+                    if (SafeCall.TmpTextMethodAvailable)
                     {
-                        string t = TextUtils.CleanRichText(tmp.text);
-                        if (!string.IsNullOrWhiteSpace(t))
-                            texts.Add(t);
+                        IntPtr il2cppStrPtr = SafeCall.ReadTmpTextSafe(tmp.Pointer);
+                        if (il2cppStrPtr != IntPtr.Zero)
+                        {
+                            try
+                            {
+                                t = IL2CPP.Il2CppStringToManaged(il2cppStrPtr);
+                                t = TextUtils.CleanRichText(t);
+                            }
+                            catch { }
+                        }
                     }
-                    catch { }
+
+                    if (!string.IsNullOrWhiteSpace(t))
+                        texts.Add(t);
                 }
 
                 if (texts.Count == 0) return null;
@@ -1599,7 +3876,7 @@ namespace SRWYAccess
                 if (typeName == "TacticalOthersCommandUIHandler")
                     return ReadOthersCommandButtonText(index);
 
-                if (typeName == "DifficultyUIHandler")
+                if (typeName == "DifficultyUIHandler" || typeName == "DifficultyUIHandler_dlc")
                     return ReadDifficultyText();
 
                 if (typeName == "SortiePreparationTopUIHandler")
@@ -1621,6 +3898,16 @@ namespace SRWYAccess
 
                 if (typeName == "LibraryCharDetailUIHandler")
                     return ReadLibraryCharInfo();
+
+                if (typeName == "GameOverUIHandler")
+                {
+                    // SelectMenu enum: Retry=0, MainMenu=1
+                    switch (index)
+                    {
+                        case 0: return Loc.Get("gameover_retry");
+                        case 1: return Loc.Get("gameover_mainmenu");
+                    }
+                }
             }
             catch { }
 
@@ -1767,7 +4054,21 @@ namespace SRWYAccess
                     var tmp = textList[0];
                     if ((object)tmp != null)
                     {
-                        string t = TextUtils.CleanRichText(tmp.text);
+                        // CRITICAL: Use SafeCall to read tmp.text
+                        string t = null;
+                        if (SafeCall.TmpTextMethodAvailable)
+                        {
+                            IntPtr il2cppStrPtr = SafeCall.ReadTmpTextSafe(tmp.Pointer);
+                            if (il2cppStrPtr != IntPtr.Zero)
+                            {
+                                try
+                                {
+                                    t = IL2CPP.Il2CppStringToManaged(il2cppStrPtr);
+                                    t = TextUtils.CleanRichText(t);
+                                }
+                                catch { }
+                            }
+                        }
                         if (!string.IsNullOrWhiteSpace(t)) return t;
                     }
                 }
@@ -1826,7 +4127,7 @@ namespace SRWYAccess
                 var tmp = textArr[0];
                 if ((object)tmp == null) return null;
 
-                string name = TextUtils.CleanRichText(tmp.text);
+                string name = ReadTmpSafe(tmp);
                 if (string.IsNullOrWhiteSpace(name)) return null;
 
                 // Include SP cost if available
@@ -1839,7 +4140,7 @@ namespace SRWYAccess
                         var costTmp = costArr[0];
                         if ((object)costTmp != null)
                         {
-                            string cost = TextUtils.CleanRichText(costTmp.text);
+                            string cost = ReadTmpSafe(costTmp);
                             if (!string.IsNullOrWhiteSpace(cost) && cost != "-1")
                                 costSuffix = " SP:" + cost;
                         }
@@ -1889,7 +4190,7 @@ namespace SRWYAccess
                 var tmp = textArr[0];
                 if ((object)tmp == null) return null;
 
-                string name = TextUtils.CleanRichText(tmp.text);
+                string name = ReadTmpSafe(tmp);
                 if (string.IsNullOrWhiteSpace(name)) return null;
 
                 // Include SP cost if available
@@ -1901,7 +4202,7 @@ namespace SRWYAccess
                         var costTmp = costArr[0];
                         if ((object)costTmp != null)
                         {
-                            string cost = TextUtils.CleanRichText(costTmp.text);
+                            string cost = ReadTmpSafe(costTmp);
                             if (!string.IsNullOrWhiteSpace(cost) && cost != "-1")
                                 return name + " SP:" + cost;
                         }
@@ -1916,43 +4217,48 @@ namespace SRWYAccess
         }
 
         /// <summary>
-        /// Read difficulty text from DifficultyUIHandler.
+        /// Read difficulty text from DifficultyUIHandler or DifficultyUIHandler_dlc.
         /// Uses modeTitleText and modeText TMP fields for rendered text.
+        /// Both classes have the same fields but are separate types.
         /// </summary>
         private string ReadDifficultyText()
         {
+            string title = null;
+            string desc = null;
+
+            // Try DifficultyUIHandler first
             try
             {
                 var handler = _activeHandler.TryCast<DifficultyUIHandler>();
-                if ((object)handler == null) return null;
-
-                string title = null;
-                string desc = null;
-
-                try
+                if ((object)handler != null)
                 {
-                    var titleTmp = handler.modeTitleText;
-                    if ((object)titleTmp != null)
-                        title = TextUtils.CleanRichText(titleTmp.text);
+                    try { var tmp = handler.modeTitleText; if ((object)tmp != null) title = ReadTmpSafe(tmp); } catch { }
+                    try { var tmp = handler.modeText; if ((object)tmp != null) desc = ReadTmpSafe(tmp); } catch { }
                 }
-                catch { }
-
-                try
-                {
-                    var descTmp = handler.modeText;
-                    if ((object)descTmp != null)
-                        desc = TextUtils.CleanRichText(descTmp.text);
-                }
-                catch { }
-
-                if (!string.IsNullOrWhiteSpace(title) && !string.IsNullOrWhiteSpace(desc))
-                    return Loc.Get("difficulty_description", title, desc);
-                if (!string.IsNullOrWhiteSpace(title))
-                    return title;
-                if (!string.IsNullOrWhiteSpace(desc))
-                    return desc;
             }
             catch { }
+
+            // Try DifficultyUIHandler_dlc if base type didn't work
+            if (string.IsNullOrWhiteSpace(title) && string.IsNullOrWhiteSpace(desc))
+            {
+                try
+                {
+                    var dlcHandler = _activeHandler.TryCast<DifficultyUIHandler_dlc>();
+                    if ((object)dlcHandler != null)
+                    {
+                        try { var tmp = dlcHandler.modeTitleText; if ((object)tmp != null) title = ReadTmpSafe(tmp); } catch { }
+                        try { var tmp = dlcHandler.modeText; if ((object)tmp != null) desc = ReadTmpSafe(tmp); } catch { }
+                    }
+                }
+                catch { }
+            }
+
+            if (!string.IsNullOrWhiteSpace(title) && !string.IsNullOrWhiteSpace(desc))
+                return Loc.Get("difficulty_description", title, desc);
+            if (!string.IsNullOrWhiteSpace(title))
+                return title;
+            if (!string.IsNullOrWhiteSpace(desc))
+                return desc;
             return null;
         }
 
@@ -2008,7 +4314,7 @@ namespace SRWYAccess
                     var name = handler.dtOfficialName;
                     if ((object)name != null)
                     {
-                        string t = TextUtils.CleanRichText(name.text);
+                        string t = ReadTmpSafe(name);
                         if (!string.IsNullOrWhiteSpace(t)) parts.Add(t);
                     }
                 }
@@ -2019,7 +4325,7 @@ namespace SRWYAccess
                     var prod = handler.dtProductName;
                     if ((object)prod != null)
                     {
-                        string t = TextUtils.CleanRichText(prod.text);
+                        string t = ReadTmpSafe(prod);
                         if (!string.IsNullOrWhiteSpace(t)) parts.Add(t);
                     }
                 }
@@ -2030,7 +4336,7 @@ namespace SRWYAccess
                     var desc = handler.dtDescription;
                     if ((object)desc != null)
                     {
-                        string t = TextUtils.CleanRichText(desc.text);
+                        string t = ReadTmpSafe(desc);
                         if (!string.IsNullOrWhiteSpace(t) && t.Length > 2)
                         {
                             if (t.Length > 200) t = t.Substring(0, 200) + "...";
@@ -2063,7 +4369,7 @@ namespace SRWYAccess
                     var name = handler.dtOfficialName;
                     if ((object)name != null)
                     {
-                        string t = TextUtils.CleanRichText(name.text);
+                        string t = ReadTmpSafe(name);
                         if (!string.IsNullOrWhiteSpace(t)) parts.Add(t);
                     }
                 }
@@ -2074,7 +4380,7 @@ namespace SRWYAccess
                     var nick = handler.dtNickName;
                     if ((object)nick != null)
                     {
-                        string t = TextUtils.CleanRichText(nick.text);
+                        string t = ReadTmpSafe(nick);
                         if (!string.IsNullOrWhiteSpace(t)) parts.Add(t);
                     }
                 }
@@ -2085,7 +4391,7 @@ namespace SRWYAccess
                     var voice = handler.dtVoiceActor;
                     if ((object)voice != null)
                     {
-                        string t = TextUtils.CleanRichText(voice.text);
+                        string t = ReadTmpSafe(voice);
                         if (!string.IsNullOrWhiteSpace(t)) parts.Add("CV:" + t);
                     }
                 }
@@ -2096,7 +4402,7 @@ namespace SRWYAccess
                     var desc = handler.dtDescription;
                     if ((object)desc != null)
                     {
-                        string t = TextUtils.CleanRichText(desc.text);
+                        string t = ReadTmpSafe(desc);
                         if (!string.IsNullOrWhiteSpace(t) && t.Length > 2)
                         {
                             if (t.Length > 200) t = t.Substring(0, 200) + "...";
@@ -2126,7 +4432,16 @@ namespace SRWYAccess
                 var go = _activeHandler.gameObject;
                 if ((object)go == null || go.Pointer == IntPtr.Zero) return null;
 
-                var tmps = go.GetComponentsInChildren<TextMeshProUGUI>(false);
+                Il2CppInterop.Runtime.InteropTypes.Arrays.Il2CppArrayBase<TextMeshProUGUI> tmps = null;
+                try
+                {
+                    tmps = go.GetComponentsInChildren<TextMeshProUGUI>(false);
+                }
+                catch (Exception ex)
+                {
+                    DebugHelper.Write($"GMR: ReadAllVisibleText GetComponentsInChildren error: {ex.GetType().Name}");
+                    return null;
+                }
                 if (tmps == null || tmps.Count == 0) return null;
 
                 var texts = new System.Collections.Generic.List<string>();
@@ -2135,16 +4450,29 @@ namespace SRWYAccess
                 {
                     if (texts.Count >= ModConfig.ReviewVisibleMaxItems || charCount >= ModConfig.ReviewVisibleMaxChars) break;
                     if ((object)tmp == null) continue;
-                    try
+
+                    // CRITICAL: Use SafeCall to read tmp.text - direct access causes
+                    // uncatchable AV when TMP object is destroyed during scene transitions
+                    string t = null;
+                    if (SafeCall.TmpTextMethodAvailable)
                     {
-                        string t = TextUtils.CleanRichText(tmp.text);
-                        if (!string.IsNullOrWhiteSpace(t) && t.Length > 1 && !IsNumericOnly(t))
+                        IntPtr il2cppStrPtr = SafeCall.ReadTmpTextSafe(tmp.Pointer);
+                        if (il2cppStrPtr != IntPtr.Zero)
                         {
-                            texts.Add(t);
-                            charCount += t.Length;
+                            try
+                            {
+                                t = IL2CPP.Il2CppStringToManaged(il2cppStrPtr);
+                                t = TextUtils.CleanRichText(t);
+                            }
+                            catch { }
                         }
                     }
-                    catch { }
+
+                    if (!string.IsNullOrWhiteSpace(t) && t.Length > 1 && !IsNumericOnly(t))
+                    {
+                        texts.Add(t);
+                        charCount += t.Length;
+                    }
                 }
 
                 return texts.Count > 0 ? string.Join("  ", texts) : null;
@@ -2202,6 +4530,10 @@ namespace SRWYAccess
                 {
                     return 6;
                 }
+                else if (typeName == "GameOverUIHandler")
+                {
+                    return 2;
+                }
             }
             catch { }
 
@@ -2238,6 +4570,14 @@ namespace SRWYAccess
             string screenName = GetScreenName();
             if (screenName != null)
                 items.Add(screenName);
+
+            // StatusUIHandler: structured reading per tab
+            // TacticalPartStatusUIHandler extends StatusUIHandler (tactical map F key)
+            if (_activeHandlerType == "StatusUIHandler" || _activeHandlerType == "TacticalPartStatusUIHandler")
+            {
+                CollectStatusScreenItems(items);
+                return;
+            }
 
             // Info screens: read all visible TMP text (stats, details)
             if (_infoScreenTypes.Contains(_activeHandlerType))
@@ -2327,6 +4667,8 @@ namespace SRWYAccess
             {
                 if ((object)_listHandler == null || _listHandler.Pointer == IntPtr.Zero) return;
 
+                if (!SafeCall.ProbeObject(_listHandler.Pointer)) { _listHandler = null; return; }
+
                 var listItems = _listHandler.m_ListItem;
                 if ((object)listItems == null) return;
 
@@ -2366,7 +4708,16 @@ namespace SRWYAccess
                 var go = _activeHandler.gameObject;
                 if ((object)go == null || go.Pointer == IntPtr.Zero) return;
 
-                var buttons = go.GetComponentsInChildren<Button>(false);
+                Il2CppInterop.Runtime.InteropTypes.Arrays.Il2CppArrayBase<Button> buttons = null;
+                try
+                {
+                    buttons = go.GetComponentsInChildren<Button>(false);
+                }
+                catch (Exception ex)
+                {
+                    DebugHelper.Write($"GMR: CollectGenericButtonItems GetComponentsInChildren error: {ex.GetType().Name}");
+                    return;
+                }
                 if (buttons == null || buttons.Count == 0) return;
 
                 int cursorIndex = -1;
@@ -2395,6 +4746,90 @@ namespace SRWYAccess
             catch { }
         }
 
+        /// <summary>
+        /// Collect structured status screen items for R key review.
+        /// Routes to pilot/robot/weapon structured readers based on current tab.
+        /// </summary>
+        private void CollectStatusScreenItems(List<string> items)
+        {
+            try
+            {
+                var statusHandler = _activeHandler.TryCast<StatusUIHandler>();
+                if ((object)statusHandler == null)
+                {
+                    CollectInfoScreenItems(items);
+                    return;
+                }
+
+                int uiType = (int)statusHandler.currentUIType;
+                if (uiType == 0) // PILOT
+                {
+                    string pilotInfo = ReadStatusPilotInfo(statusHandler);
+                    if (!string.IsNullOrWhiteSpace(pilotInfo))
+                    {
+                        foreach (var part in pilotInfo.Split(new[] { ". " }, StringSplitOptions.RemoveEmptyEntries))
+                            items.Add(part);
+                    }
+                }
+                else if (uiType == 1) // ROBOT
+                {
+                    string robotInfo = ReadStatusRobotInfo(statusHandler);
+                    if (!string.IsNullOrWhiteSpace(robotInfo))
+                    {
+                        foreach (var part in robotInfo.Split(new[] { ". " }, StringSplitOptions.RemoveEmptyEntries))
+                            items.Add(part);
+                    }
+                }
+                else if (uiType == 2) // WEAPON
+                {
+                    // Collect all weapons in the list
+                    CollectStatusWeaponListItems(items, statusHandler);
+                }
+                else
+                {
+                    CollectInfoScreenItems(items);
+                }
+            }
+            catch
+            {
+                CollectInfoScreenItems(items);
+            }
+        }
+
+        /// <summary>
+        /// Collect all weapon items from the status weapon list for R key review.
+        /// </summary>
+        private void CollectStatusWeaponListItems(List<string> items, StatusUIHandler statusHandler)
+        {
+            try
+            {
+                var weaponUI = statusHandler.weaponUIHandler;
+                if ((object)weaponUI == null) return;
+
+                var listUI = weaponUI.listUIHandler;
+                if ((object)listUI == null || listUI.Pointer == IntPtr.Zero) return;
+                if (!SafeCall.ProbeObject(listUI.Pointer)) return;
+
+                int listCount = listUI.GetListCount();
+                int cursorIndex = -1;
+                try { cursorIndex = _activeHandler.currentCursorIndex; } catch { }
+
+                var listItems = listUI.m_ListItem;
+                if ((object)listItems == null || listItems.Count == 0) return;
+
+                for (int i = 0; i < listCount && i < 30; i++)
+                {
+                    string weaponText = ReadStatusWeaponItem(statusHandler, i);
+                    if (!string.IsNullOrWhiteSpace(weaponText))
+                    {
+                        string prefix = (i == cursorIndex) ? "(*) " : "";
+                        items.Add(prefix + weaponText);
+                    }
+                }
+            }
+            catch { }
+        }
+
         private void CollectInfoScreenItems(List<string> items)
         {
             if ((object)_activeHandler == null) return;
@@ -2404,20 +4839,42 @@ namespace SRWYAccess
                 var go = _activeHandler.gameObject;
                 if ((object)go == null || go.Pointer == IntPtr.Zero) return;
 
-                var tmps = go.GetComponentsInChildren<TextMeshProUGUI>(false);
+                Il2CppInterop.Runtime.InteropTypes.Arrays.Il2CppArrayBase<TextMeshProUGUI> tmps = null;
+                try
+                {
+                    tmps = go.GetComponentsInChildren<TextMeshProUGUI>(false);
+                }
+                catch (Exception ex)
+                {
+                    DebugHelper.Write($"GMR: CollectNonButtonItems GetComponentsInChildren error: {ex.GetType().Name}");
+                    return;
+                }
                 if (tmps == null || tmps.Count == 0) return;
 
                 foreach (var tmp in tmps)
                 {
                     if (items.Count >= ModConfig.ReviewInfoMaxItems) break;
                     if ((object)tmp == null) continue;
-                    try
+
+                    // CRITICAL: Use SafeCall to read tmp.text - direct access causes
+                    // uncatchable AV when TMP object is destroyed during scene transitions
+                    string t = null;
+                    if (SafeCall.TmpTextMethodAvailable)
                     {
-                        string t = TextUtils.CleanRichText(tmp.text);
-                        if (!string.IsNullOrWhiteSpace(t) && t.Length > 1)
-                            items.Add(t);
+                        IntPtr il2cppStrPtr = SafeCall.ReadTmpTextSafe(tmp.Pointer);
+                        if (il2cppStrPtr != IntPtr.Zero)
+                        {
+                            try
+                            {
+                                t = IL2CPP.Il2CppStringToManaged(il2cppStrPtr);
+                                t = TextUtils.CleanRichText(t);
+                            }
+                            catch { }
+                        }
                     }
-                    catch { }
+
+                    if (!string.IsNullOrWhiteSpace(t) && t.Length > 1)
+                        items.Add(t);
                 }
             }
             catch { }
@@ -2449,7 +4906,7 @@ namespace SRWYAccess
                     CollectBonusItems(items);
                 else if (_activeHandlerType == "CreditWindowUIHandler")
                     CollectCreditItems(items);
-                else if (_activeHandlerType == "AssistLinkManager")
+                else if (_activeHandlerType == "AssistLinkManager" || _activeHandlerType == "AssistLinkSystem")
                     CollectAssistLinkItems(items);
                 else if (_activeHandlerType == "SurvivalMissionResultUIHandler"
                     || _activeHandlerType == "MissionChartUIHandler")
@@ -2463,11 +4920,11 @@ namespace SRWYAccess
             var handler = _activeHandler.TryCast<ActionResultUIHandler>();
             if ((object)handler == null) return;
 
-            try { var tmp = handler.characterName; if ((object)tmp != null) { string t = TextUtils.CleanRichText(tmp.text); if (!string.IsNullOrWhiteSpace(t)) items.Add(t); } } catch { }
-            try { var tmp = handler.level; if ((object)tmp != null) { string t = TextUtils.CleanRichText(tmp.text); if (!string.IsNullOrWhiteSpace(t)) items.Add(Loc.Get("review_level", t)); } } catch { }
-            try { var tmp = handler.gainExp; if ((object)tmp != null) { string t = TextUtils.CleanRichText(tmp.text); if (!string.IsNullOrWhiteSpace(t)) items.Add("EXP +" + t); } } catch { }
-            try { var tmp = handler.gainScore; if ((object)tmp != null) { string t = TextUtils.CleanRichText(tmp.text); if (!string.IsNullOrWhiteSpace(t)) items.Add(Loc.Get("review_score", t)); } } catch { }
-            try { var tmp = handler.gainCredit; if ((object)tmp != null) { string t = TextUtils.CleanRichText(tmp.text); if (!string.IsNullOrWhiteSpace(t)) items.Add(Loc.Get("review_credits", t)); } } catch { }
+            try { var tmp = handler.characterName; if ((object)tmp != null) { string t = ReadTmpSafe(tmp); if (!string.IsNullOrWhiteSpace(t)) items.Add(t); } } catch { }
+            try { var tmp = handler.level; if ((object)tmp != null) { string t = ReadTmpSafe(tmp); if (!string.IsNullOrWhiteSpace(t)) items.Add(Loc.Get("review_level", t)); } } catch { }
+            try { var tmp = handler.gainExp; if ((object)tmp != null) { string t = ReadTmpSafe(tmp); if (!string.IsNullOrWhiteSpace(t)) items.Add("EXP +" + t); } } catch { }
+            try { var tmp = handler.gainScore; if ((object)tmp != null) { string t = ReadTmpSafe(tmp); if (!string.IsNullOrWhiteSpace(t)) items.Add(Loc.Get("review_score", t)); } } catch { }
+            try { var tmp = handler.gainCredit; if ((object)tmp != null) { string t = ReadTmpSafe(tmp); if (!string.IsNullOrWhiteSpace(t)) items.Add(Loc.Get("review_credits", t)); } } catch { }
 
             // EXP progress (current/max)
             try
@@ -2485,13 +4942,13 @@ namespace SRWYAccess
             var handler = _activeHandler.TryCast<LvUpUIHandler>();
             if ((object)handler == null) return;
 
-            try { var tmp = handler.characterName; if ((object)tmp != null) { string t = TextUtils.CleanRichText(tmp.text); if (!string.IsNullOrWhiteSpace(t)) items.Add(t); } } catch { }
+            try { var tmp = handler.characterName; if ((object)tmp != null) { string t = ReadTmpSafe(tmp); if (!string.IsNullOrWhiteSpace(t)) items.Add(t); } } catch { }
             try
             {
                 var bLv = handler.beforeLevel;
                 var nLv = handler.nowLevel;
-                string before = ((object)bLv != null) ? TextUtils.CleanRichText(bLv.text) : "";
-                string now = ((object)nLv != null) ? TextUtils.CleanRichText(nLv.text) : "";
+                string before = ((object)bLv != null) ? ReadTmpSafe(bLv) : "";
+                string now = ((object)nLv != null) ? ReadTmpSafe(nLv) : "";
                 if (!string.IsNullOrWhiteSpace(before) || !string.IsNullOrWhiteSpace(now))
                     items.Add(Loc.Get("review_lvup_level", before, now));
             }
@@ -2567,8 +5024,8 @@ namespace SRWYAccess
             try
             {
                 string before = "", now = "";
-                try { var tmp = param.before; if ((object)tmp != null) before = TextUtils.CleanRichText(tmp.text) ?? ""; } catch { }
-                try { var tmp = param.now; if ((object)tmp != null) now = TextUtils.CleanRichText(tmp.text) ?? ""; } catch { }
+                try { var tmp = param.before; if ((object)tmp != null) before = ReadTmpSafe(tmp) ?? ""; } catch { }
+                try { var tmp = param.now; if ((object)tmp != null) now = ReadTmpSafe(tmp) ?? ""; } catch { }
                 if (!string.IsNullOrWhiteSpace(before) || !string.IsNullOrWhiteSpace(now))
                 {
                     if (before != now)
@@ -2585,8 +5042,8 @@ namespace SRWYAccess
             var handler = _activeHandler.TryCast<AceBonusUIHandler>();
             if ((object)handler == null) return;
 
-            try { var tmp = handler.characterName; if ((object)tmp != null) { string t = TextUtils.CleanRichText(tmp.text); if (!string.IsNullOrWhiteSpace(t)) items.Add(t); } } catch { }
-            try { var tmp = handler.bonusDescription; if ((object)tmp != null) { string t = TextUtils.CleanRichText(tmp.text); if (!string.IsNullOrWhiteSpace(t)) items.Add(t); } } catch { }
+            try { var tmp = handler.characterName; if ((object)tmp != null) { string t = ReadTmpSafe(tmp); if (!string.IsNullOrWhiteSpace(t)) items.Add(t); } } catch { }
+            try { var tmp = handler.bonusDescription; if ((object)tmp != null) { string t = ReadTmpSafe(tmp); if (!string.IsNullOrWhiteSpace(t)) items.Add(t); } } catch { }
         }
 
         private void CollectCharacterSelectionItems(List<string> items)
@@ -2604,21 +5061,25 @@ namespace SRWYAccess
             var handler = _activeHandler.TryCast<BattleCheckMenuHandler>();
             if ((object)handler == null) return;
 
-            // Left (attacker) unit info
+            // Left (attacker) unit info + parametor data
             try
             {
                 var left = handler.leftUnitInfo;
+                BattleCheckMenuParametor leftParam = null;
+                try { leftParam = handler.baseLeftMainParam; } catch { }
                 if ((object)left != null)
-                    CollectBattleCheckUnitInfo(items, left, Loc.Get("battle_left"));
+                    CollectBattleCheckUnitInfo(items, left, leftParam, Loc.Get("battle_left"));
             }
             catch { }
 
-            // Right (defender) unit info
+            // Right (defender) unit info + parametor data
             try
             {
                 var right = handler.rightUnitInfo;
+                BattleCheckMenuParametor rightParam = null;
+                try { rightParam = handler.baseRightMainParam; } catch { }
                 if ((object)right != null)
-                    CollectBattleCheckUnitInfo(items, right, Loc.Get("battle_right"));
+                    CollectBattleCheckUnitInfo(items, right, rightParam, Loc.Get("battle_right"));
             }
             catch { }
 
@@ -2641,7 +5102,7 @@ namespace SRWYAccess
             catch { }
         }
 
-        private static void CollectBattleCheckUnitInfo(List<string> items, BattleCheckMenuUnitInfoHandler info, string side)
+        private static void CollectBattleCheckUnitInfo(List<string> items, BattleCheckMenuUnitInfoHandler info, BattleCheckMenuParametor param, string side)
         {
             try
             {
@@ -2689,16 +5150,31 @@ namespace SRWYAccess
                     items.Add(weaponLine);
                 }
 
-                // Combat predictions: hit rate, damage, critical, attack power
-                string hit = ReadTmpSafe(info.hitRate);
-                string damage = ReadTmpSafe(info.weaponDamage);
-                string crit = ReadTmpSafe(info.criticalRate);
-                string atk = ReadTmpSafe(info.attackPower);
+                // Combat predictions: prefer parametor int values (sprite damage shows "-" in TMP)
                 var combat = new System.Collections.Generic.List<string>();
-                if (!string.IsNullOrWhiteSpace(hit)) combat.Add(Loc.Get("battle_hit_rate") + " " + hit);
-                if (!string.IsNullOrWhiteSpace(damage)) combat.Add(Loc.Get("battle_damage") + " " + damage);
-                if (!string.IsNullOrWhiteSpace(crit)) combat.Add(Loc.Get("battle_critical") + " " + crit);
-                if (!string.IsNullOrWhiteSpace(atk)) combat.Add(Loc.Get("battle_attack_power") + " " + atk);
+                if ((object)param != null)
+                {
+                    try
+                    {
+                        combat.Add(Loc.Get("battle_hit_rate") + " " + param.hitRate + "%");
+                        combat.Add(Loc.Get("battle_damage") + " " + param.predictDamage);
+                        combat.Add(Loc.Get("battle_critical") + " " + param.criticalRate + "%");
+                        combat.Add(Loc.Get("battle_attack_power") + " " + param.attackPower);
+                    }
+                    catch { }
+                }
+                if (combat.Count == 0)
+                {
+                    // Fallback to TMP text if parametor unavailable
+                    string hit = ReadTmpSafe(info.hitRate);
+                    string damage = ReadTmpSafe(info.weaponDamage);
+                    string crit = ReadTmpSafe(info.criticalRate);
+                    string atk = ReadTmpSafe(info.attackPower);
+                    if (!string.IsNullOrWhiteSpace(hit)) combat.Add(Loc.Get("battle_hit_rate") + " " + hit);
+                    if (!string.IsNullOrWhiteSpace(damage)) combat.Add(Loc.Get("battle_damage") + " " + damage);
+                    if (!string.IsNullOrWhiteSpace(crit)) combat.Add(Loc.Get("battle_critical") + " " + crit);
+                    if (!string.IsNullOrWhiteSpace(atk)) combat.Add(Loc.Get("battle_attack_power") + " " + atk);
+                }
                 if (combat.Count > 0)
                     items.Add(string.Join(", ", combat));
 
@@ -2733,12 +5209,24 @@ namespace SRWYAccess
         private static string ReadTmpSafe(TextMeshProUGUI tmp)
         {
             if ((object)tmp == null) return null;
-            try
+
+            // CRITICAL: Use SafeCall to read tmp.text - direct access causes
+            // uncatchable AV when TMP object is destroyed during scene transitions
+            if (SafeCall.TmpTextMethodAvailable)
             {
-                string t = TextUtils.CleanRichText(tmp.text);
-                return string.IsNullOrWhiteSpace(t) ? null : t;
+                IntPtr il2cppStrPtr = SafeCall.ReadTmpTextSafe(tmp.Pointer);
+                if (il2cppStrPtr != IntPtr.Zero)
+                {
+                    try
+                    {
+                        string t = IL2CPP.Il2CppStringToManaged(il2cppStrPtr);
+                        t = TextUtils.CleanRichText(t);
+                        return string.IsNullOrWhiteSpace(t) ? null : t;
+                    }
+                    catch { }
+                }
             }
-            catch { return null; }
+            return null;
         }
 
         // ===== Supplementary Info =====
@@ -2759,9 +5247,9 @@ namespace SRWYAccess
                     var handler = _activeHandler.TryCast<ShopUIHandler>();
                     if ((object)handler == null) return;
 
-                    try { var tmp = handler.explanationText; if ((object)tmp != null) { string t = TextUtils.CleanRichText(tmp.text); if (!string.IsNullOrWhiteSpace(t)) items.Add(t); } } catch { }
-                    try { var tmp = handler.totalPriceText; if ((object)tmp != null) { string t = TextUtils.CleanRichText(tmp.text); if (!string.IsNullOrWhiteSpace(t)) items.Add(Loc.Get("review_total_price", t)); } } catch { }
-                    try { var tmp = handler.remainCreditText; if ((object)tmp != null) { string t = TextUtils.CleanRichText(tmp.text); if (!string.IsNullOrWhiteSpace(t)) items.Add(Loc.Get("review_remaining_credits", t)); } } catch { }
+                    try { var tmp = handler.explanationText; if ((object)tmp != null) { string t = ReadTmpSafe(tmp); if (!string.IsNullOrWhiteSpace(t)) items.Add(t); } } catch { }
+                    try { var tmp = handler.totalPriceText; if ((object)tmp != null) { string t = ReadTmpSafe(tmp); if (!string.IsNullOrWhiteSpace(t)) items.Add(Loc.Get("review_total_price", t)); } } catch { }
+                    try { var tmp = handler.remainCreditText; if ((object)tmp != null) { string t = ReadTmpSafe(tmp); if (!string.IsNullOrWhiteSpace(t)) items.Add(Loc.Get("review_remaining_credits", t)); } } catch { }
                 }
                 else if (_activeHandlerType == "WeaponListHandler")
                 {
@@ -2783,6 +5271,206 @@ namespace SRWYAccess
                 {
                     CollectSaveLoadInfo(items);
                 }
+                else if (_activeHandlerType == "MissionUIHandler")
+                {
+                    CollectMissionInfo(items);
+                }
+                else if (_activeHandlerType == "SelectDogmaUIHandler"
+                    || _activeHandlerType == "SelectTacticalCommandUIHandler"
+                    || _activeHandlerType == "SelectSpecialCommandUIHandler")
+                {
+                    CollectSpecialCommandDescription(items);
+                }
+                else if (_activeHandlerType == "BackLogUIHandler")
+                {
+                    CollectBackLogContent(items);
+                }
+                else if (_activeHandlerType == "PilotTrainingUIHandler")
+                {
+                    CollectPilotTrainingInfo(items);
+                }
+            }
+            catch { }
+        }
+
+        /// <summary>
+        /// Read pilot training info: skill description, current tab, dialog info.
+        /// </summary>
+        private void CollectPilotTrainingInfo(List<string> items)
+        {
+            try
+            {
+                var handler = _activeHandler.TryCast<PilotTrainingUIHandler>();
+                if ((object)handler == null) return;
+
+                // Current tab
+                try
+                {
+                    var menuType = handler.currentMenuType;
+                    string tabName = menuType switch
+                    {
+                        PilotTrainingUIHandler.MenuType.Skill => Loc.Get("training_tab_skill"),
+                        PilotTrainingUIHandler.MenuType.Param => Loc.Get("training_tab_param"),
+                        _ => null
+                    };
+                    if (!string.IsNullOrWhiteSpace(tabName))
+                        items.Add(tabName);
+                }
+                catch { }
+
+                // Skill description from statusHandler
+                try
+                {
+                    var sh = handler.statusHandler;
+                    if ((object)sh != null)
+                    {
+                        var tmp = sh.explanationText;
+                        if ((object)tmp != null)
+                        {
+                            string t = ReadTmpSafe(tmp);
+                            if (!string.IsNullOrWhiteSpace(t))
+                                items.Add(t);
+                        }
+                    }
+                }
+                catch { }
+
+                // Learn dialog info
+                try
+                {
+                    var dialog = handler.LearnSkillDialog;
+                    if ((object)dialog != null)
+                    {
+                        var dialogGo = dialog.go;
+                        if ((object)dialogGo != null && dialogGo.activeInHierarchy)
+                        {
+                            string skillName = ReadTmpSafe(dialog.learningSkillProgramText);
+                            if (!string.IsNullOrWhiteSpace(skillName))
+                                items.Add(Loc.Get("training_learning") + " " + skillName);
+
+                            string needBuy = ReadTmpSafe(dialog.needToBuyText);
+                            if (!string.IsNullOrWhiteSpace(needBuy))
+                                items.Add(needBuy);
+
+                            string cost = ReadTmpSafe(dialog.costCreditText);
+                            if (!string.IsNullOrWhiteSpace(cost))
+                                items.Add(Loc.Get("training_cost") + " " + cost);
+                        }
+                    }
+                }
+                catch { }
+
+                // Upgrade param dialog info
+                try
+                {
+                    var dialog = handler.UpgradeParamDialog;
+                    if ((object)dialog != null)
+                    {
+                        var dialogGo = dialog.go;
+                        if ((object)dialogGo != null && dialogGo.activeInHierarchy)
+                        {
+                            string skillName = ReadTmpSafe(dialog.learningSkillProgramText);
+                            if (!string.IsNullOrWhiteSpace(skillName))
+                                items.Add(Loc.Get("training_upgrading") + " " + skillName);
+
+                            string cost = ReadTmpSafe(dialog.costCreditText);
+                            if (!string.IsNullOrWhiteSpace(cost))
+                                items.Add(Loc.Get("training_cost") + " " + cost);
+                        }
+                    }
+                }
+                catch { }
+            }
+            catch { }
+        }
+
+        /// <summary>
+        /// Read mission area name from MissionUIHandler.areaName TMP.
+        /// </summary>
+        private void CollectMissionInfo(List<string> items)
+        {
+            try
+            {
+                var handler = _activeHandler.TryCast<MissionUIHandler>();
+                if ((object)handler == null) return;
+
+                // Area/layer name
+                try
+                {
+                    var tmp = handler.areaName;
+                    if ((object)tmp != null)
+                    {
+                        string t = ReadTmpSafe(tmp);
+                        if (!string.IsNullOrWhiteSpace(t))
+                            items.Add(t);
+                    }
+                }
+                catch { }
+            }
+            catch { }
+        }
+
+        /// <summary>
+        /// Read description text from SelectSpecialCommandUIHandler.descriptionText TMP.
+        /// Works for SelectDogmaUIHandler and SelectTacticalCommandUIHandler too
+        /// since they inherit from SelectSpecialCommandUIHandler.
+        /// </summary>
+        private void CollectSpecialCommandDescription(List<string> items)
+        {
+            try
+            {
+                var handler = _activeHandler.TryCast<SelectSpecialCommandUIHandler>();
+                if ((object)handler == null) return;
+
+                try
+                {
+                    var tmp = handler.descriptionText;
+                    if ((object)tmp != null)
+                    {
+                        string t = ReadTmpSafe(tmp);
+                        if (!string.IsNullOrWhiteSpace(t))
+                            items.Add(t);
+                    }
+                }
+                catch { }
+            }
+            catch { }
+        }
+
+        /// <summary>
+        /// Read visible text from BackLogUIHandler.objectContent children.
+        /// The backlog is a scroll view of dialogue history text.
+        /// </summary>
+        private void CollectBackLogContent(List<string> items)
+        {
+            try
+            {
+                var handler = _activeHandler.TryCast<BackLogUIHandler>();
+                if ((object)handler == null) return;
+
+                // Read TMP text from objectContent children
+                try
+                {
+                    var content = handler.objectContent;
+                    if ((object)content == null) return;
+
+                    var tmps = content.GetComponentsInChildren<TextMeshProUGUI>(false);
+                    if (tmps == null || tmps.Count == 0) return;
+
+                    for (int i = 0; i < tmps.Count && i < 20; i++)
+                    {
+                        try
+                        {
+                            var tmp = tmps[i];
+                            if ((object)tmp == null) continue;
+                            string t = ReadTmpSafe(tmp);
+                            if (!string.IsNullOrWhiteSpace(t))
+                                items.Add(t);
+                        }
+                        catch { }
+                    }
+                }
+                catch { }
             }
             catch { }
         }
@@ -2984,84 +5672,129 @@ namespace SRWYAccess
 
         /// <summary>
         /// Read assist link detail info for screen review.
-        /// Reads directly from AssistLinkManager's detail panel TMP text fields
-        /// (command_name_text, command_effect_text, passive_effect_text, etc.)
-        /// which the game populates when the player selects an item.
-        /// This avoids the GetAssistLinkData mutable/reused data issue entirely.
+        /// Uses cached data from navigation (ReadAssistLinkItemText) for main fields,
+        /// supplemented by TMP fields for additional info (SP cost, EXP, etc.).
+        /// TMP detail panel is safe to read during R key review because:
+        /// - Our hook runs inside InputManager.Update()
+        /// - AssistLinkManager.Update() ran in the previous frame
+        /// - No cursor change during R key press → TMP shows correct data
         /// </summary>
         private void CollectAssistLinkItems(List<string> items)
         {
             try
             {
-                var alm = _activeHandler.TryCast<AssistLinkManager>();
+                var alm = GetActiveAssistLinkManager();
                 if ((object)alm == null) return;
                 if (alm.Pointer == IntPtr.Zero) return;
 
-                // Read detail panel TMP fields directly from AssistLinkManager.
-                // These are populated by the game's setCommandEffectString() when
-                // the user navigates to an item - always up to date, no mutable data issues.
+                // Effects are now read directly from TMP below (not from GetAssistLinkData
+                // which returns stale effect fields during battle).
 
-                // Character name from detail panel
-                string charaName = null;
-                try { var tmp = alm.select_chara_name_text; if ((object)tmp != null) charaName = TextUtils.CleanRichText(tmp.text); } catch { }
+                // === Title: cmdName - personName + level ===
+                string cmdName = _cachedALCommandName;
+                string personName = _cachedALPersonName;
 
-                // Command skill name
-                string cmdName = null;
-                try { var tmp = alm.command_name_text; if ((object)tmp != null) cmdName = TextUtils.CleanRichText(tmp.text); } catch { }
+                // Read from TMP if cached is empty (TMP is current after previous frame's Update)
+                try
+                {
+                    if (string.IsNullOrWhiteSpace(cmdName))
+                    {
+                        var tmp = alm.command_name_text;
+                        if ((object)tmp != null) { string t = ReadTmpSafe(tmp); if (!string.IsNullOrWhiteSpace(t)) cmdName = t; }
+                    }
+                }
+                catch { }
+                try
+                {
+                    if (string.IsNullOrWhiteSpace(personName))
+                    {
+                        var tmp = alm.select_chara_name_text;
+                        if ((object)tmp != null) { string t = ReadTmpSafe(tmp); if (!string.IsNullOrWhiteSpace(t)) personName = t; }
+                    }
+                }
+                catch { }
 
-                // Build title: cmdName - charaName Lv.X
                 var sb = new System.Text.StringBuilder();
                 if (!string.IsNullOrWhiteSpace(cmdName))
                 {
                     sb.Append(cmdName);
-                    if (!string.IsNullOrWhiteSpace(charaName))
+                    if (!string.IsNullOrWhiteSpace(personName))
                     {
                         sb.Append(" - ");
-                        sb.Append(charaName);
+                        sb.Append(personName);
                     }
                 }
-                else if (!string.IsNullOrWhiteSpace(charaName))
+                else if (!string.IsNullOrWhiteSpace(personName))
                 {
-                    sb.Append(charaName);
+                    sb.Append(personName);
                 }
 
-                // Level from detail panel
-                string levelText = null;
-                try { var tmp = alm.select_chara_level_text; if ((object)tmp != null) levelText = TextUtils.CleanRichText(tmp.text); } catch { }
-                if (!string.IsNullOrWhiteSpace(levelText))
+                // Add level and registered status from cached work data
+                if (_cachedALLevel >= 0)
                 {
                     sb.Append(" ");
-                    sb.Append(levelText);
+                    sb.Append(Loc.Get("assistlink_level", _cachedALLevel + 1));
+                }
+                if (_cachedALRegistered)
+                {
+                    sb.Append(" [");
+                    sb.Append(Loc.Get("assistlink_registered"));
+                    sb.Append("]");
                 }
 
                 if (sb.Length > 0)
                     items.Add(sb.ToString());
 
-                // Command effect description
+                // === Command effect ===
+                // ALWAYS read from TMP (GetAssistLinkData effects are stale during battle)
                 string cmdEffect = null;
-                try { var tmp = alm.command_effect_text; if ((object)tmp != null) cmdEffect = TextUtils.CleanRichText(tmp.text); } catch { }
+                try { var tmp = alm.command_effect_text; if ((object)tmp != null) cmdEffect = ReadTmpSafe(tmp); } catch { }
                 if (!string.IsNullOrWhiteSpace(cmdEffect))
                     items.Add(Loc.Get("assistlink_command_effect", cmdEffect));
 
-                // Passive effect description
+                // === Passive effect ===
+                // ALWAYS read from TMP
                 string passiveEffect = null;
-                try { var tmp = alm.passive_effect_text; if ((object)tmp != null) passiveEffect = TextUtils.CleanRichText(tmp.text); } catch { }
+                try { var tmp = alm.passive_effect_text; if ((object)tmp != null) passiveEffect = ReadTmpSafe(tmp); } catch { }
                 if (!string.IsNullOrWhiteSpace(passiveEffect))
                     items.Add(Loc.Get("assistlink_passive_effect", passiveEffect));
 
-                // Duration type
-                string duration = null;
-                try { var tmp = alm.duration_type_text; if ((object)tmp != null) duration = TextUtils.CleanRichText(tmp.text); } catch { }
-                if (!string.IsNullOrWhiteSpace(duration))
-                    items.Add(Loc.Get("assistlink_duration", duration));
+                // Duration type (from TMP, supplementary)
+                try
+                {
+                    var tmp = alm.duration_type_text;
+                    if ((object)tmp != null) { string t = ReadTmpSafe(tmp); if (!string.IsNullOrWhiteSpace(t)) items.Add(t); }
+                }
+                catch { }
 
-                // Selection count (e.g. "2/3" equipped)
+                // === SP cost ===
+                try
+                {
+                    var tmp = alm.DoucmentSpiritText;
+                    if ((object)tmp != null) { string t = ReadTmpSafe(tmp); if (!string.IsNullOrWhiteSpace(t)) items.Add("SP: " + t); }
+                }
+                catch { }
+
+                // === EXP info ===
+                try
+                {
+                    var tmpNow = alm.now_exp_text;
+                    var tmpNext = alm.next_exp_text;
+                    string nowExp = null, nextExp = null;
+                    if ((object)tmpNow != null) nowExp = ReadTmpSafe(tmpNow);
+                    if ((object)tmpNext != null) nextExp = ReadTmpSafe(tmpNext);
+                    if (!string.IsNullOrWhiteSpace(nowExp) || !string.IsNullOrWhiteSpace(nextExp))
+                        items.Add("EXP: " + (nowExp ?? "0") + " / " + (nextExp ?? "?"));
+                }
+                catch { }
+
+                // Selection count (global counter, not item-specific)
                 string selCount = null;
-                try { var tmp = alm.NowSelectionCount_text; if ((object)tmp != null) selCount = TextUtils.CleanRichText(tmp.text); } catch { }
+                try { var tmp = alm.NowSelectionCount_text; if ((object)tmp != null) selCount = ReadTmpSafe(tmp); } catch { }
                 if (!string.IsNullOrWhiteSpace(selCount))
                     items.Add(Loc.Get("assistlink_selection_count", selCount));
 
-                DebugHelper.Write($"AssistLink review (TMP): name=[{charaName}] cmd=[{cmdName}] effect=[{cmdEffect}] passive=[{passiveEffect}] dur=[{duration}]");
+                DebugHelper.Write($"AssistLink review: cmd=[{cmdName}] person=[{personName}] effect=[{cmdEffect}] passive=[{passiveEffect}]");
             }
             catch { }
         }
@@ -3099,7 +5832,7 @@ namespace SRWYAccess
                         var explanTmp = equip.explanationText;
                         if ((object)explanTmp != null)
                         {
-                            string desc = TextUtils.CleanRichText(explanTmp.text);
+                            string desc = ReadTmpSafe(explanTmp);
                             if (!string.IsNullOrWhiteSpace(desc))
                                 items.Add(desc);
                         }
@@ -3144,7 +5877,7 @@ namespace SRWYAccess
                     var explanTmp = expl.explanText;
                     if ((object)explanTmp != null)
                     {
-                        string desc = TextUtils.CleanRichText(explanTmp.text);
+                        string desc = ReadTmpSafe(explanTmp);
                         if (!string.IsNullOrWhiteSpace(desc))
                             items.Add(desc);
                     }
@@ -3167,7 +5900,16 @@ namespace SRWYAccess
                 var go = _activeHandler.gameObject;
                 if ((object)go == null || go.Pointer == IntPtr.Zero) return;
 
-                var tmps = go.GetComponentsInChildren<TextMeshProUGUI>(false);
+                Il2CppInterop.Runtime.InteropTypes.Arrays.Il2CppArrayBase<TextMeshProUGUI> tmps = null;
+                try
+                {
+                    tmps = go.GetComponentsInChildren<TextMeshProUGUI>(false);
+                }
+                catch (Exception ex)
+                {
+                    DebugHelper.Write($"GMR: CollectNonButtonText GetComponentsInChildren error: {ex.GetType().Name}");
+                    return;
+                }
                 if (tmps == null || tmps.Count == 0) return;
 
                 int charCount = 0;
@@ -3182,7 +5924,7 @@ namespace SRWYAccess
                         var parentBtn = tmp.GetComponentInParent<Button>();
                         if ((object)parentBtn != null) continue;
 
-                        string t = TextUtils.CleanRichText(tmp.text);
+                        string t = ReadTmpSafe(tmp);
                         if (string.IsNullOrWhiteSpace(t) || t.Length <= 1) continue;
 
                         items.Add(t);
@@ -3192,6 +5934,101 @@ namespace SRWYAccess
                 }
             }
             catch { }
+        }
+
+        // ===== Sort/Filter Text Monitoring =====
+
+        /// <summary>
+        /// Detect sort/filter TMP components from the current list handler.
+        /// Called once when a new handler with a ListHandlerBase is found.
+        /// Caches the TMP references for efficient per-poll monitoring.
+        /// </summary>
+        private void DetectSortFilterTmp()
+        {
+            try
+            {
+                if ((object)_listHandler == null || _listHandler.Pointer == IntPtr.Zero)
+                    return;
+                if (!SafeCall.ProbeObject(_listHandler.Pointer))
+                    return;
+
+                // Try each known list handler subtype that has sort/filter TMP
+                var unitList = _listHandler.TryCast<UnitListHandler>();
+                if ((object)unitList != null)
+                {
+                    _sortTmp = unitList.m_SortTypeText;
+                    return;
+                }
+
+                var missionList = _listHandler.TryCast<MissionListHandler>();
+                if ((object)missionList != null)
+                {
+                    _sortTmp = missionList.m_SortTypeText;
+                    _filterTmp = missionList.m_FilterTypeText;
+                    return;
+                }
+
+                var partsList = _listHandler.TryCast<PartsEquipSelectPartsListUIHandler>();
+                if ((object)partsList != null)
+                {
+                    _sortTmp = partsList.m_SortTypeText;
+                    _filterTmp = partsList.m_FilterTypeText;
+                    return;
+                }
+            }
+            catch (Exception ex)
+            {
+                DebugHelper.Write($"GenericMenu: DetectSortFilterTmp error: {ex.GetType().Name}");
+            }
+        }
+
+        /// <summary>
+        /// Check sort/filter TMP text for changes and announce.
+        /// Called from main update loop each poll cycle.
+        /// </summary>
+        public void CheckSortFilterText()
+        {
+            if ((object)_sortTmp == null && (object)_filterTmp == null)
+                return;
+
+            try
+            {
+                // Read sort text
+                if ((object)_sortTmp != null)
+                {
+                    string sortText = ReadTmpSafe(_sortTmp);
+                    if (sortText != null && sortText != _lastSortText)
+                    {
+                        _lastSortText = sortText;
+                        if (!string.IsNullOrWhiteSpace(sortText))
+                        {
+                            ScreenReaderOutput.Say(Loc.Get("sort_type", sortText));
+                            DebugHelper.Write($"GenericMenu: Sort changed: {sortText}");
+                        }
+                    }
+                }
+
+                // Read filter text
+                if ((object)_filterTmp != null)
+                {
+                    string filterText = ReadTmpSafe(_filterTmp);
+                    if (filterText != null && filterText != _lastFilterText)
+                    {
+                        _lastFilterText = filterText;
+                        if (!string.IsNullOrWhiteSpace(filterText))
+                        {
+                            ScreenReaderOutput.Say(Loc.Get("filter_type", filterText));
+                            DebugHelper.Write($"GenericMenu: Filter changed: {filterText}");
+                        }
+                    }
+                }
+            }
+            catch
+            {
+                // TMP destroyed - clear references
+                _sortTmp = null;
+                _filterTmp = null;
+            }
         }
 
         // ===== Utility =====

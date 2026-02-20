@@ -180,6 +180,76 @@ namespace SRWYAccess
                 "SRWYAccess ロード完了",
                 "SRWYAccess 로드됨");
 
+            Add("mod_enabled",
+                "Mod enabled",
+                "模组已启用",
+                "模組已啟用",
+                "モッド有効",
+                "모드 활성화");
+
+            Add("mod_disabled",
+                "Mod disabled",
+                "模组已禁用",
+                "模組已停用",
+                "モッド無効",
+                "모드 비활성화");
+
+            Add("mod_reset",
+                "Mod state reset",
+                "模组状态已重置",
+                "模組狀態已重置",
+                "モッド状態リセット",
+                "모드 상태 초기화");
+
+            Add("mod_critical_error",
+                "Mod error occurred",
+                "模组发生错误",
+                "模組發生錯誤",
+                "モッドエラーが発生しました",
+                "모드 오류 발생");
+
+            Add("handler_disabled",
+                "Feature disabled due to errors",
+                "功能因错误已禁用",
+                "功能因錯誤已停用",
+                "エラーにより機能が無効化されました",
+                "오류로 인해 기능 비활성화됨");
+
+            Add("audio_cues_on",
+                "Audio cues on",
+                "音效提示已开启",
+                "音效提示已開啟",
+                "オーディオキューON",
+                "오디오 큐 켜짐");
+
+            Add("audio_cues_off",
+                "Audio cues off",
+                "音效提示已关闭",
+                "音效提示已關閉",
+                "オーディオキューOFF",
+                "오디오 큐 꺼짐");
+
+            Add("sort_type",
+                "Sort: {0}",
+                "排序：{0}",
+                "排序：{0}",
+                "ソート：{0}",
+                "정렬: {0}");
+
+            Add("filter_type",
+                "Filter: {0}",
+                "筛选：{0}",
+                "篩選：{0}",
+                "フィルター：{0}",
+                "필터: {0}");
+
+            Add("safe_mode_enabled",
+                "Mod entered safe mode. Only basic features available.",
+                "模组进入安全模式，仅提供基本功能",
+                "模組進入安全模式，僅提供基本功能",
+                "モッドがセーフモードに入りました。基本機能のみ利用可能です",
+                "모드가 안전 모드로 전환됨. 기본 기능만 사용 가능");
+
             // ===== TITLE SCREEN =====
             Add("state_title",
                 "Title screen",
@@ -934,6 +1004,57 @@ namespace SRWYAccess
                 "残高：{0}",
                 "잔액: {0}");
 
+            Add("shop_price",
+                "Price:",
+                "价格：",
+                "價格：",
+                "価格：",
+                "가격:");
+            Add("shop_owned",
+                "Owned:",
+                "持有：",
+                "持有：",
+                "所持：",
+                "보유:");
+            Add("shop_buy_count",
+                "Buying:",
+                "购买：",
+                "購買：",
+                "購入：",
+                "구매:");
+
+            // ===== PILOT TRAINING =====
+            Add("training_tab_skill",
+                "Skills Tab",
+                "技能页",
+                "技能頁",
+                "スキルタブ",
+                "스킬 탭");
+            Add("training_tab_param",
+                "Parameters Tab",
+                "能力值页",
+                "能力值頁",
+                "能力値タブ",
+                "능력치 탭");
+            Add("training_learning",
+                "Learning:",
+                "学习：",
+                "學習：",
+                "習得：",
+                "학습:");
+            Add("training_upgrading",
+                "Upgrading:",
+                "强化：",
+                "強化：",
+                "強化：",
+                "강화:");
+            Add("training_cost",
+                "Cost:",
+                "费用：",
+                "費用：",
+                "費用：",
+                "비용:");
+
             // ===== STAT LABELS =====
             Add("stat_melee",
                 "Melee",
@@ -1004,6 +1125,55 @@ namespace SRWYAccess
                 "視野",
                 "射程",
                 "시야");
+
+            Add("stat_accuracy",
+                "Accuracy",
+                "照准",
+                "照準",
+                "照準",
+                "조준");
+
+            Add("stat_score",
+                "Kills",
+                "击坠数",
+                "擊墜數",
+                "撃墜数",
+                "격추수");
+
+            Add("stat_move_max",
+                "Max movement",
+                "最大移动范围",
+                "最大移動範圍",
+                "最大移動",
+                "최대 이동");
+
+            Add("stat_move_remaining",
+                "Remaining steps",
+                "剩余步数",
+                "剩餘步數",
+                "残り移動",
+                "남은 이동");
+
+            Add("stat_attack_range",
+                "Attack range",
+                "攻击范围",
+                "攻擊範圍",
+                "攻撃射程",
+                "공격 사거리");
+
+            Add("range_no_weapons",
+                "No weapons available",
+                "没有可用武器",
+                "沒有可用武器",
+                "使用可能な武器なし",
+                "사용 가능한 무기 없음");
+
+            Add("range_after_move",
+                "After move",
+                "移动后",
+                "移動後",
+                "移動後",
+                "이동 후");
 
             // ===== MAP TERRAIN =====
             Add("map_terrain_block",
@@ -1331,6 +1501,190 @@ namespace SRWYAccess
                 "必要気力",
                 "필요 기력");
 
+            // ===== WEAPON ATTRIBUTES =====
+            Add("weapon_melee",
+                "Melee",
+                "格斗",
+                "格鬥",
+                "格闘",
+                "격투");
+
+            Add("weapon_shooting",
+                "Ranged",
+                "射击",
+                "射擊",
+                "射撃",
+                "사격");
+
+            Add("weapon_beam",
+                "Beam",
+                "光束",
+                "光束",
+                "ビーム",
+                "빔");
+
+            Add("weapon_entity",
+                "Physical",
+                "实弹",
+                "實彈",
+                "実弾",
+                "실탄");
+
+            Add("weapon_barrier_pen",
+                "Barrier Pen.",
+                "屏障贯通",
+                "屏障貫通",
+                "バリア貫通",
+                "배리어관통");
+
+            Add("weapon_ignore_size",
+                "Size Ignore",
+                "尺寸无视",
+                "尺寸無視",
+                "サイズ無視",
+                "사이즈무시");
+
+            Add("weapon_post_move",
+                "P",
+                "移",
+                "移",
+                "移",
+                "이");
+
+            Add("weapon_counter",
+                "Counter",
+                "反击可",
+                "反擊可",
+                "反撃可",
+                "반격가능");
+
+            Add("weapon_map",
+                "MAP",
+                "MAP",
+                "MAP",
+                "MAP",
+                "MAP");
+
+            Add("weapon_map_straight",
+                "MAP Straight",
+                "MAP直线型",
+                "MAP直線型",
+                "MAP直線型",
+                "MAP직선형");
+
+            Add("weapon_map_landing",
+                "MAP Landing",
+                "MAP着弹型",
+                "MAP著彈型",
+                "MAP着弾型",
+                "MAP착탄형");
+
+            Add("weapon_map_center",
+                "MAP Center",
+                "MAP自机中心",
+                "MAP自機中心",
+                "MAP自機中心型",
+                "MAP자기중심형");
+
+            Add("weapon_map_range",
+                "MAP Range:{0}",
+                "MAP射程:{0}",
+                "MAP射程:{0}",
+                "MAP射程:{0}",
+                "MAP사정:{0}");
+
+            Add("weapon_map_tiles",
+                "{0} tiles",
+                "{0}格",
+                "{0}格",
+                "{0}マス",
+                "{0}칸");
+
+            Add("weapon_map_friendly_fire",
+                "Friendly Fire",
+                "友军误伤",
+                "友軍誤傷",
+                "友軍誤射",
+                "아군오사");
+
+            // MAP weapon targeting announcements
+            Add("map_weapon_targets",
+                "{0} enemies, {1} allies in range",
+                "范围内: {0}个敌人, {1}个友军",
+                "範圍內: {0}個敵人, {1}個友軍",
+                "範囲内: 敵{0}体, 味方{1}体",
+                "범위 내: 적{0}기, 아군{1}기");
+
+            Add("map_weapon_targets_enemy_only",
+                "{0} enemies in range",
+                "范围内: {0}个敌人",
+                "範圍內: {0}個敵人",
+                "範囲内: 敵{0}体",
+                "범위 내: 적{0}기");
+
+            Add("map_weapon_no_targets",
+                "No targets in range",
+                "范围内无目标",
+                "範圍內無目標",
+                "範囲内に対象なし",
+                "범위 내 대상 없음");
+
+            Add("weapon_debuff_en_down",
+                "EN Down",
+                "EN减少",
+                "EN減少",
+                "EN低下",
+                "EN감소");
+
+            Add("weapon_debuff_armor_down",
+                "Armor Down",
+                "装甲减少",
+                "裝甲減少",
+                "装甲低下",
+                "장갑감소");
+
+            Add("weapon_debuff_mobility_down",
+                "Mobility Down",
+                "运动性减少",
+                "運動性減少",
+                "運動性低下",
+                "운동성감소");
+
+            Add("weapon_debuff_sight_down",
+                "Sight Down",
+                "照准减少",
+                "照準減少",
+                "照準低下",
+                "조준감소");
+
+            Add("weapon_debuff_morale_down",
+                "Morale Down",
+                "气力减少",
+                "氣力減少",
+                "気力低下",
+                "기력감소");
+
+            Add("weapon_debuff_sp_down",
+                "SP Down",
+                "SP减少",
+                "SP減少",
+                "SP低下",
+                "SP감소");
+
+            Add("weapon_debuff_param_half",
+                "Param Halve",
+                "能力减半",
+                "能力減半",
+                "能力半減",
+                "능력반감");
+
+            Add("weapon_debuff_shutdown",
+                "Shutdown",
+                "行动不能",
+                "行動不能",
+                "行動不能",
+                "행동불능");
+
             // ===== BATTLE CHECK AUTO-READ =====
             Add("battle_vs",
                 "vs",
@@ -1374,6 +1728,14 @@ namespace SRWYAccess
                 "{0}, {1}, {2}",
                 "{0}, {1}, {2}",
                 "{0}, {1}, {2}");
+
+            // ===== STATUS SCREEN TABS =====
+            Add("status_tab_pilot",
+                "Pilot", "驾驶员", "駕駛員", "パイロット", "파일럿");
+            Add("status_tab_robot",
+                "Robot", "机体", "機體", "機体", "기체");
+            Add("status_tab_weapon",
+                "Weapon", "武器", "武器", "武器", "무기");
 
             // ===== ADDITIONAL STATE ANNOUNCEMENTS =====
             Add("state_opening_demo",
@@ -1446,6 +1808,18 @@ namespace SRWYAccess
                 "特殊指令",
                 "特殊コマンド",
                 "특수 커맨드");
+            Add("screen_selectdogmauihandler",
+                "Dogma Command",
+                "信條指令",
+                "信條指令",
+                "ドグマコマンド",
+                "도그마 커맨드");
+            Add("screen_selecttacticalcommanduihandler",
+                "Tactical Command",
+                "戰術指令",
+                "戰術指令",
+                "タクティカルコマンド",
+                "전술 커맨드");
 
             // ===== PARTS EQUIP =====
             Add("parts_count",
@@ -1469,6 +1843,489 @@ namespace SRWYAccess
                 "{0}：{1}",
                 "{0}：{1}",
                 "{0}: {1}");
+
+            // ===== NEWLY COVERED SCREEN NAMES =====
+            Add("screen_saveconfirmdialoguihandler",
+                "Save Confirmation",
+                "保存确认",
+                "儲存確認",
+                "セーブ確認",
+                "저장 확인");
+
+            Add("screen_prologuesystem",
+                "Prologue",
+                "序章",
+                "序章",
+                "プロローグ",
+                "프롤로그");
+
+            Add("screen_fullcustombonusuihandler",
+                "Custom Bonus",
+                "自定义奖励",
+                "自訂獎勵",
+                "カスタムボーナス",
+                "커스텀 보너스");
+
+            Add("screen_custombonuseffectuihandler",
+                "Bonus Effect",
+                "奖励效果",
+                "獎勵效果",
+                "ボーナス効果",
+                "보너스 효과");
+
+            Add("screen_optionuihandler",
+                "System Options",
+                "系统设置",
+                "系統設定",
+                "システムオプション",
+                "시스템 옵션");
+
+            Add("screen_optionuihandlerv",
+                "System Options",
+                "系统设置",
+                "系統設定",
+                "システムオプション",
+                "시스템 옵션");
+
+            Add("screen_libraryplayerrecorduihandler",
+                "Player Record",
+                "游玩记录",
+                "遊玩記錄",
+                "プレイレコード",
+                "플레이 레코드");
+
+            Add("screen_licencewindowuihandler",
+                "License",
+                "许可协议",
+                "授權協議",
+                "ライセンス",
+                "라이선스");
+
+            Add("screen_designworkuihandler",
+                "Design Works",
+                "设计作品",
+                "設計作品",
+                "デザインワークス",
+                "디자인 워크");
+
+            Add("screen_resultdisplay",
+                "Battle Result",
+                "战斗结果",
+                "戰鬥結果",
+                "戦闘結果",
+                "전투 결과");
+
+            Add("screen_resultdisplay2",
+                "Battle Rewards",
+                "战斗奖励",
+                "戰鬥獎勵",
+                "戦闘報酬",
+                "전투 보상");
+
+            Add("screen_battledetailsuihandler",
+                "Battle Details",
+                "战斗详情",
+                "戰鬥詳情",
+                "バトル詳細",
+                "전투 상세");
+
+            Add("screen_difficultyuihandler_dlc",
+                "Difficulty Select",
+                "难度选择",
+                "難度選擇",
+                "難易度選択",
+                "난이도 선택");
+
+            Add("screen_singlesimplebattlehandler",
+                "Simple Battle",
+                "简易战斗",
+                "簡易戰鬥",
+                "シンプルバトル",
+                "심플 배틀");
+
+            Add("screen_intermissionuihandler",
+                "Intermission",
+                "幕间",
+                "幕間",
+                "インターミッション",
+                "인터미션");
+            Add("screen_sortiepreparationrobotlistuihandler",
+                "Sortie Robot List",
+                "出击机体列表",
+                "出擊機體列表",
+                "出撃ロボットリスト",
+                "출격 로봇 리스트");
+            Add("screen_sortiepreparationpilotlistuihandler",
+                "Sortie Pilot List",
+                "出击驾驶员列表",
+                "出擊駕駛員列表",
+                "出撃パイロットリスト",
+                "출격 파일럿 리스트");
+            Add("screen_tacticalpartstatusuihandler",
+                "Unit Status",
+                "机体状态",
+                "機體狀態",
+                "ユニットステータス",
+                "유닛 스테이터스");
+            Add("screen_sortieshipselect",
+                "Ship Select",
+                "战舰选择",
+                "戰艦選擇",
+                "艦船選択",
+                "함선 선택");
+            Add("screen_sortieunitselect",
+                "Unit Select",
+                "机体选择",
+                "機體選擇",
+                "ユニット選択",
+                "유닛 선택");
+
+            // Support selection
+            Add("support_attack_screen",
+                "Attack Support",
+                "攻击支援",
+                "攻擊支援",
+                "攻撃サポート",
+                "공격 지원");
+            Add("support_defence_screen",
+                "Defence Support",
+                "防御支援",
+                "防禦支援",
+                "防御サポート",
+                "방어 지원");
+            Add("support_none",
+                "No Support",
+                "无支援",
+                "無支援",
+                "サポートなし",
+                "지원 없음");
+            Add("support_double_attack",
+                "Double Attack",
+                "合体攻击",
+                "合體攻擊",
+                "ダブルアタック",
+                "더블 어택");
+
+            // Save/Load details
+            Add("save_new_slot",
+                "Empty Slot",
+                "空存档",
+                "空存檔",
+                "空きスロット",
+                "빈 슬롯");
+            Add("save_auto",
+                "Auto Save",
+                "自动存档",
+                "自動存檔",
+                "オートセーブ",
+                "자동 저장");
+            Add("save_chapter",
+                "Chapter {0}",
+                "第{0}章",
+                "第{0}章",
+                "第{0}章",
+                "{0}장");
+            Add("save_turn",
+                "Turn {0}",
+                "回合 {0}",
+                "回合 {0}",
+                "ターン {0}",
+                "턴 {0}");
+            Add("save_playtime",
+                "Playtime {0}",
+                "游戏时间 {0}",
+                "遊戲時間 {0}",
+                "プレイ時間 {0}",
+                "플레이 시간 {0}");
+            Add("save_lap",
+                "Lap {0}",
+                "周目 {0}",
+                "周目 {0}",
+                "周目 {0}",
+                "회차 {0}");
+
+            // ===== PHASE INFO (TACTICAL) =====
+            Add("phase_wave",
+                "Wave {0}/{1}",
+                "波次 {0}/{1}",
+                "波次 {0}/{1}",
+                "ウェーブ {0}/{1}",
+                "웨이브 {0}/{1}");
+
+            Add("phase_enemies",
+                "Remaining enemies: {0}",
+                "剩余敌人：{0}",
+                "剩餘敵人：{0}",
+                "残り敵数：{0}",
+                "잔여 적: {0}");
+
+            // ===== UNIT DISTANCE QUERY (;/' for enemies, .// for allies, \ repeat) =====
+            // {0}=index, {1}=total, {2}=name, {3}=direction, {4}=distance, {5}=hpNow, {6}=hpMax
+            Add("dist_enemy",
+                "Enemy {0}/{1}: {2}, {3} distance {4}, HP {5}/{6}",
+                "敌方 {0}/{1}：{2}，{3} 距离 {4}，HP {5}/{6}",
+                "敵方 {0}/{1}：{2}，{3} 距離 {4}，HP {5}/{6}",
+                "敵 {0}/{1}：{2}、{3} 距離 {4}、HP {5}/{6}",
+                "적 {0}/{1}: {2}, {3} 거리 {4}, HP {5}/{6}");
+
+            // {0}=index, {1}=total, {2}=name, {3}=direction, {4}=distance
+            Add("dist_enemy_simple",
+                "Enemy {0}/{1}: {2}, {3} distance {4}",
+                "敌方 {0}/{1}：{2}，{3} 距离 {4}",
+                "敵方 {0}/{1}：{2}，{3} 距離 {4}",
+                "敵 {0}/{1}：{2}、{3} 距離 {4}",
+                "적 {0}/{1}: {2}, {3} 거리 {4}");
+
+            // {0}=index, {1}=total, {2}=name, {3}=direction, {4}=distance, {5}=hpNow, {6}=hpMax
+            Add("dist_ally",
+                "Ally {0}/{1}: {2}, {3} distance {4}, HP {5}/{6}",
+                "友方 {0}/{1}：{2}，{3} 距离 {4}，HP {5}/{6}",
+                "友方 {0}/{1}：{2}，{3} 距離 {4}，HP {5}/{6}",
+                "味方 {0}/{1}：{2}、{3} 距離 {4}、HP {5}/{6}",
+                "아군 {0}/{1}: {2}, {3} 거리 {4}, HP {5}/{6}");
+
+            // {0}=index, {1}=total, {2}=name, {3}=direction, {4}=distance
+            Add("dist_ally_simple",
+                "Ally {0}/{1}: {2}, {3} distance {4}",
+                "友方 {0}/{1}：{2}，{3} 距离 {4}",
+                "友方 {0}/{1}：{2}，{3} 距離 {4}",
+                "味方 {0}/{1}：{2}、{3} 距離 {4}",
+                "아군 {0}/{1}: {2}, {3} 거리 {4}");
+
+            Add("dist_no_enemies",
+                "No enemy units",
+                "没有敌方单位",
+                "沒有敵方單位",
+                "敵ユニットなし",
+                "적 유닛 없음");
+
+            Add("dist_no_allies",
+                "No ally units",
+                "没有友方单位",
+                "沒有友方單位",
+                "味方ユニットなし",
+                "아군 유닛 없음");
+
+            // {0}=index, {1}=total, {2}=name, {3}=direction, {4}=distance, {5}=hpNow, {6}=hpMax
+            Add("dist_unacted",
+                "Unacted {0}/{1}: {2}, {3} distance {4}, HP {5}/{6}",
+                "未行动 {0}/{1}：{2}，{3} 距离 {4}，HP {5}/{6}",
+                "未行動 {0}/{1}：{2}，{3} 距離 {4}，HP {5}/{6}",
+                "未行動 {0}/{1}：{2}、{3} 距離 {4}、HP {5}/{6}",
+                "미행동 {0}/{1}: {2}, {3} 거리 {4}, HP {5}/{6}");
+
+            // {0}=index, {1}=total, {2}=name, {3}=direction, {4}=distance
+            Add("dist_unacted_simple",
+                "Unacted {0}/{1}: {2}, {3} distance {4}",
+                "未行动 {0}/{1}：{2}，{3} 距离 {4}",
+                "未行動 {0}/{1}：{2}，{3} 距離 {4}",
+                "未行動 {0}/{1}：{2}、{3} 距離 {4}",
+                "미행동 {0}/{1}: {2}, {3} 거리 {4}");
+
+            // {0}=index, {1}=total, {2}=name, {3}=direction, {4}=distance, {5}=hpNow, {6}=hpMax
+            Add("dist_acted",
+                "Acted {0}/{1}: {2}, {3} distance {4}, HP {5}/{6}",
+                "已行动 {0}/{1}：{2}，{3} 距离 {4}，HP {5}/{6}",
+                "已行動 {0}/{1}：{2}，{3} 距離 {4}，HP {5}/{6}",
+                "行動済 {0}/{1}：{2}、{3} 距離 {4}、HP {5}/{6}",
+                "행동완료 {0}/{1}: {2}, {3} 거리 {4}, HP {5}/{6}");
+
+            // {0}=index, {1}=total, {2}=name, {3}=direction, {4}=distance
+            Add("dist_acted_simple",
+                "Acted {0}/{1}: {2}, {3} distance {4}",
+                "已行动 {0}/{1}：{2}，{3} 距离 {4}",
+                "已行動 {0}/{1}：{2}，{3} 距離 {4}",
+                "行動済 {0}/{1}：{2}、{3} 距離 {4}",
+                "행동완료 {0}/{1}: {2}, {3} 거리 {4}");
+
+            Add("dist_no_unacted",
+                "No unacted units",
+                "没有未行动单位",
+                "沒有未行動單位",
+                "未行動ユニットなし",
+                "미행동 유닛 없음");
+
+            Add("dist_no_acted",
+                "No acted units",
+                "没有已行动单位",
+                "沒有已行動單位",
+                "行動済ユニットなし",
+                "행동완료 유닛 없음");
+
+            // ===== DIRECTION (compass bearings for unit distance) =====
+            Add("dir_n", "north", "北方", "北方", "北", "북쪽");
+            Add("dir_s", "south", "南方", "南方", "南", "남쪽");
+            Add("dir_e", "east", "东方", "東方", "東", "동쪽");
+            Add("dir_w", "west", "西方", "西方", "西", "서쪽");
+            Add("dir_ne", "northeast", "东北方", "東北方", "北東", "북동쪽");
+            Add("dir_nw", "northwest", "西北方", "西北方", "北西", "북서쪽");
+            Add("dir_se", "southeast", "东南方", "東南方", "南東", "남동쪽");
+            Add("dir_sw", "southwest", "西南方", "西南方", "南西", "남서쪽");
+            Add("dir_same", "same position", "同一位置", "同一位置", "同位置", "같은 위치");
+
+            // ===== EXPANDED STATS =====
+            Add("stat_exp",
+                "EXP",
+                "经验",
+                "經驗",
+                "経験値",
+                "경험치");
+
+            Add("stat_next_level",
+                "Next",
+                "下一级",
+                "下一級",
+                "次レベル",
+                "다음 레벨");
+
+            Add("stat_ace_rank",
+                "Rank",
+                "阶级",
+                "階級",
+                "ランク",
+                "랭크");
+
+            Add("rank_none",
+                "Normal",
+                "普通",
+                "普通",
+                "ノーマル",
+                "일반");
+
+            Add("rank_ace",
+                "Ace",
+                "王牌",
+                "王牌",
+                "エース",
+                "에이스");
+
+            Add("rank_superace",
+                "Super Ace",
+                "超级王牌",
+                "超級王牌",
+                "スーパーエース",
+                "슈퍼 에이스");
+
+            Add("rank_ultraace",
+                "Ultra Ace",
+                "究极王牌",
+                "究極王牌",
+                "ウルトラエース",
+                "울트라 에이스");
+
+            Add("stat_ace_bonus",
+                "Ace Bonus",
+                "王牌奖励",
+                "王牌獎勵",
+                "エースボーナス",
+                "에이스 보너스");
+
+            Add("stat_pilot_skills",
+                "Pilot Skills",
+                "驾驶员技能",
+                "駕駛員技能",
+                "パイロットスキル",
+                "파일럿 스킬");
+
+            Add("stat_robot_skills",
+                "Robot Abilities",
+                "机体特殊能力",
+                "機體特殊能力",
+                "機体特殊能力",
+                "기체 특수 능력");
+
+            Add("stat_spirit_commands",
+                "Spirit Commands",
+                "精神指令",
+                "精神指令",
+                "精神コマンド",
+                "정신 커맨드");
+
+            Add("stat_power_parts",
+                "Power Parts",
+                "强化零件",
+                "強化零件",
+                "強化パーツ",
+                "강화 파츠");
+
+            Add("stat_custom_bonus",
+                "Custom Bonus",
+                "自定义奖励",
+                "自訂獎勵",
+                "カスタムボーナス",
+                "커스텀 보너스");
+
+            Add("stat_upgrade_levels",
+                "Upgrades",
+                "改造",
+                "改造",
+                "改造",
+                "개조");
+
+            Add("stat_weapon_boost",
+                "Weapon",
+                "武器",
+                "武器",
+                "武器",
+                "무기");
+
+            // ===== UNIT STATS (I key) =====
+            Add("unit_no_unit",
+                "No unit at cursor",
+                "光标处没有单位",
+                "游標處沒有單位",
+                "カーソル位置にユニットなし",
+                "커서 위치에 유닛 없음");
+
+            // ===== TURN SUMMARY =====
+            // {0}=actionable count, {1}=total player units
+            Add("turn_summary",
+                "Player turn, {0}/{1} units can act",
+                "我方回合，{0}/{1}台可行动",
+                "我方回合，{0}/{1}台可行動",
+                "自軍フェイズ、{0}/{1}機行動可能",
+                "아군 페이즈, {0}/{1}기 행동 가능");
+
+            Add("turn_summary_none",
+                "Player turn",
+                "我方回合",
+                "我方回合",
+                "自軍フェイズ",
+                "아군 페이즈");
+
+            // ===== CUSTOM ROBOT (機體改造) =====
+            // {0}=robot name, {1}=1-based index, {2}=total count
+            Add("custom_robot_switch",
+                "{0} ({1}/{2})",
+                "{0} ({1}/{2})",
+                "{0} ({1}/{2})",
+                "{0} ({1}/{2})",
+                "{0} ({1}/{2})");
+
+            // {0}=stat label, {1}=current value
+            Add("custom_stat",
+                "{0}: {1}",
+                "{0}: {1}",
+                "{0}: {1}",
+                "{0}: {1}",
+                "{0}: {1}");
+
+            // {0}=stat label, {1}=before value, {2}=after value
+            Add("custom_stat_change",
+                "{0}: {1} -> {2}",
+                "{0}: {1} -> {2}",
+                "{0}: {1} -> {2}",
+                "{0}: {1} → {2}",
+                "{0}: {1} -> {2}");
+
+            // EButtonIndex stat names (order: HP=0, EN=1, AR=2, MO=3, SI=4, WP=5)
+            Add("custom_stat_hp", "HP", "HP", "HP", "HP", "HP");
+            Add("custom_stat_en", "EN", "EN", "EN", "EN", "EN");
+            Add("custom_stat_ar", "Armor", "\u88C5\u7532", "\u88DD\u7532", "\u88C5\u7532", "\uC7A5\uAC11");
+            Add("custom_stat_mo", "Mobility", "\u8FD0\u52A8\u6027", "\u904B\u52D5\u6027", "\u904B\u52D5\u6027", "\uC6B4\uB3D9\uC131");
+            Add("custom_stat_si", "Accuracy", "\u7167\u51C6", "\u7167\u6E96", "\u7167\u6E96", "\uC870\uC900");
+            Add("custom_stat_wp", "Weapons", "\u6B66\u5668", "\u6B66\u5668", "\u6B66\u5668", "\uBB34\uAE30");
+
         }
     }
 }

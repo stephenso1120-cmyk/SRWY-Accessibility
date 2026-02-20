@@ -169,7 +169,13 @@ namespace SRWYAccess
                 var pilot = prpMgr.GetPilot(referenceId);
                 if ((object)pilot == null) return referenceId;
 
-                string name = pilot.GetName();
+                // CRITICAL: Use SafeCall to read pilot name - direct GetName() causes
+                // uncatchable AccessViolationException when pilot object is destroyed
+                string name = null;
+                if (SafeCall.NameMethodsAvailable && pilot.Pointer != IntPtr.Zero)
+                {
+                    name = SafeCall.ReadPilotNameSafe(pilot.Pointer);
+                }
                 if (!string.IsNullOrEmpty(name)) return name;
             }
             catch (Exception ex)

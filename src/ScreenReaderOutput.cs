@@ -19,6 +19,13 @@ namespace SRWYAccess
         private static long _lastSpokenTicks;
         private static readonly long DedupWindowTicks = ModConfig.DedupWindowMs * TimeSpan.TicksPerMillisecond;
 
+        // Rate limiting: prevent overwhelming Tolk.dll/screen reader with rapid calls
+        private static long _lastTolkCallTicks;
+        private static readonly long MinTolkIntervalTicks = 50 * TimeSpan.TicksPerMillisecond; // 50ms minimum between calls
+        private static int _tolkCallsThisSecond;
+        private static long _tolkCallsSecondStart;
+        private const int MaxTolkCallsPerSecond = 10; // safety limit
+
         #region Tolk P/Invoke
 
         [DllImport("Tolk.dll", CallingConvention = CallingConvention.Cdecl)]
@@ -109,18 +116,41 @@ namespace SRWYAccess
         /// <summary>
         /// Speak text and show on braille display. Interrupts current speech.
         /// Deduplicates identical messages within a short window to prevent spam.
+        /// Rate-limited to prevent overwhelming Tolk.dll/screen reader.
         /// </summary>
         public static void Say(string message)
         {
             if (string.IsNullOrEmpty(message)) return;
 
-            // Deduplicate: skip if same message within 300ms window
             long now = DateTime.UtcNow.Ticks;
+
+            // Deduplicate: skip if same message within 300ms window
             if (message == _lastSpokenText && (now - _lastSpokenTicks) < DedupWindowTicks)
                 return;
 
+            // Rate limiting: enforce minimum interval between ANY calls
+            if ((now - _lastTolkCallTicks) < MinTolkIntervalTicks)
+            {
+                try { MelonLogger.Warning($"[SRWYAccess] [SR-THROTTLED] {message}"); } catch { }
+                return;
+            }
+
+            // Rate limiting: per-second call counter
+            if (now - _tolkCallsSecondStart > TimeSpan.TicksPerSecond)
+            {
+                _tolkCallsThisSecond = 0;
+                _tolkCallsSecondStart = now;
+            }
+            if (_tolkCallsThisSecond >= MaxTolkCallsPerSecond)
+            {
+                try { MelonLogger.Warning($"[SRWYAccess] [SR-RATELIMIT] {message}"); } catch { }
+                return;
+            }
+
             _lastSpokenText = message;
             _lastSpokenTicks = now;
+            _lastTolkCallTicks = now;
+            _tolkCallsThisSecond++;
             _lastMessage = message;
 
             try { MelonLogger.Msg($"[SRWYAccess] [SR] {message}"); } catch { }
@@ -140,18 +170,41 @@ namespace SRWYAccess
         /// <summary>
         /// Speak text without interrupting current speech (queued).
         /// Participates in deduplication to prevent repeated queued messages.
+        /// Rate-limited to prevent overwhelming Tolk.dll/screen reader.
         /// </summary>
         public static void SayQueued(string message)
         {
             if (string.IsNullOrEmpty(message)) return;
 
-            // Deduplicate: skip if same message within dedup window
             long now = DateTime.UtcNow.Ticks;
+
+            // Deduplicate: skip if same message within dedup window
             if (message == _lastSpokenText && (now - _lastSpokenTicks) < DedupWindowTicks)
                 return;
 
+            // Rate limiting: enforce minimum interval between ANY calls
+            if ((now - _lastTolkCallTicks) < MinTolkIntervalTicks)
+            {
+                try { MelonLogger.Warning($"[SRWYAccess] [SR+-THROTTLED] {message}"); } catch { }
+                return;
+            }
+
+            // Rate limiting: per-second call counter
+            if (now - _tolkCallsSecondStart > TimeSpan.TicksPerSecond)
+            {
+                _tolkCallsThisSecond = 0;
+                _tolkCallsSecondStart = now;
+            }
+            if (_tolkCallsThisSecond >= MaxTolkCallsPerSecond)
+            {
+                try { MelonLogger.Warning($"[SRWYAccess] [SR+-RATELIMIT] {message}"); } catch { }
+                return;
+            }
+
             _lastSpokenText = message;
             _lastSpokenTicks = now;
+            _lastTolkCallTicks = now;
+            _tolkCallsThisSecond++;
             _lastMessage = message;
 
             try { MelonLogger.Msg($"[SRWYAccess] [SR+] {message}"); } catch { }

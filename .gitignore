@@ -11,3 +11,6 @@ src/obj/
 Thumbs.db
 Desktop.ini
 .DS_Store
+
+# Decompiled game code (copyright)
+decompiled/

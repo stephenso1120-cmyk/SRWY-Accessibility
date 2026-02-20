@@ -6,9 +6,11 @@ using System.Threading;
 using MelonLoader;
 using UnityEngine;
 using Il2CppInterop.Runtime;
-using Il2CppInterop.Runtime.Injection;
 using Il2CppCom.BBStudio.SRTeam.Inputs;
+using Il2CppCom.BBStudio.SRTeam.Map;
+using Il2CppCom.BBStudio.SRTeam.Data;
 using Il2CppCom.BBStudio.SRTeam.UIs;
+using MonoMod.RuntimeDetour;
 
 [assembly: MelonInfo(typeof(SRWYAccess.SRWYAccessMod), "SRWYAccess", "0.2.0", "SRWYAccess Team")]
 [assembly: MelonGame("Bandai Namco Entertainment", "SUPER ROBOT WARS Y")]
@@ -107,8 +109,8 @@ namespace SRWYAccess
     }
 
     /// <summary>
-    /// Core mod logic. Initialization runs on a background thread, then a Harmony
-    /// patch on InputManager.Update() runs all handler logic on the Unity main thread.
+    /// Core mod logic. Initialization runs on a background thread, then a native
+    /// hook on InputManager.Update() runs all handler logic on the Unity main thread.
     /// </summary>
     internal static class ModCore
     {
@@ -118,6 +120,23 @@ namespace SRWYAccess
         private const int VK_OEM_4 = 0xDB; // [ key
         private const int VK_OEM_6 = 0xDD; // ] key
         private const int VK_R = 0x52;     // R key
+        private const int VK_OEM_1 = 0xBA; // ; key (prev enemy)
+        private const int VK_OEM_7 = 0xDE; // ' key (next enemy)
+        private const int VK_OEM_PERIOD = 0xBE; // . key (prev ally)
+        private const int VK_OEM_2 = 0xBF; // / key (next ally)
+        private const int VK_OEM_5 = 0xDC; // \ key (repeat last distance)
+        private const int VK_SHIFT = 0x10;   // Shift modifier
+        private const int VK_CONTROL = 0x11; // Ctrl modifier
+
+        private const int VK_Q = 0x51;    // Q key (L1 - tab switch left)
+        private const int VK_E = 0x45;    // E key (R1 - tab switch right)
+        private const int VK_1 = 0x31;    // 1 key (L1 - tab switch left alt)
+        private const int VK_3 = 0x33;    // 3 key (R1 - tab switch right alt)
+        private const int VK_OEM_PLUS = 0xBB;  // = key (movement range)
+        private const int VK_OEM_MINUS = 0xBD; // - key (attack range)
+        private const int VK_F2 = 0x71;   // F2 key (toggle mod)
+        private const int VK_F3 = 0x72;   // F3 key (reload mod state)
+        private const int VK_F4 = 0x73;   // F4 key (toggle audio cues)
 
         private static bool _started;
         private static volatile bool _initialized;
@@ -131,8 +150,11 @@ namespace SRWYAccess
         private static AdventureDialogueHandler _adventureDialogueHandler;
         private static BattleSubtitleHandler _battleSubtitleHandler;
         private static BattleResultHandler _battleResultHandler;
+        private static MapWeaponTargetHandler _mapWeaponTargetHandler;
         private static TacticalMapHandler _tacticalMapHandler;
+        private static UnitDistanceHandler _unitDistanceHandler;
         private static ScreenReviewManager _screenReviewManager;
+        private static SupporterHandler _supporterHandler;
 
         // Main thread state (only accessed from main thread after _initialized = true)
         private static int _frameCount;
@@ -141,16 +163,53 @@ namespace SRWYAccess
         private static int _noneLoadingCount;
         private static int _heartbeat;
         private static int _battlePoll;
+        private static int _battleSceneDiag; // diagnostic: log first N frames after BATTLE_SCENE entry
+        // _adventureDiag removed: diagnostic logging disabled to reduce I/O overhead
         private static int _resultPoll;
         private static int _resultTimeout;
         private static bool _postTitle;
         private static bool _postTactical;
+        private static bool _postAdventure; // suppress NONE probe after ADVENTURE→NONE (crash #28)
         private static bool _noneProbeActive;
+        private static int _transitionBlackout; // skip ALL mod logic during dangerous transitions
+        private static bool _pendingTurnSummary; // announce unit count after enemy turn ends
+
+        // FindObjectsOfType throttling
+        private static int _lastFOTFrame = 0;
+        private const int FOT_MIN_INTERVAL = 30; // ~500ms at 60fps
+
+        // Safe mode: graceful degradation when too many critical errors occur
+        private static int _criticalErrors = 0;
+        private static bool _safeMode = false;
+        private const int SAFE_MODE_THRESHOLD = 3;
         private static bool _resultPending;
         private static InputManager.InputMode _lastKnownMode;
         private static bool _lastKeyR;
         private static bool _lastKeyLeft;
         private static bool _lastKeyRight;
+        private static bool _lastKeySemicolon;
+        private static bool _lastKeyApostrophe;
+        private static bool _lastKeyPeriod;
+        private static bool _lastKeySlash;
+        private static bool _lastKeyBackslash;
+        private static bool _lastKeyQ;
+        private static bool _lastKeyE;
+        private static bool _lastKey1;
+        private static bool _lastKey3;
+
+        private static bool _lastKeyEquals;
+        private static bool _lastKeyMinus;
+        private static bool _lastKeyF2;
+        private static bool _lastKeyF3;
+        private static bool _lastKeyF4;
+        private static bool _modEnabled = true;
+        private static bool _isInLoadingState; // guards CheckReviewKeys during transitions
+
+        // Crash breadcrumb: tracks execution stage in OnMainThreadUpdate.
+        // Logged with each heartbeat. On process-level crash, the last heartbeat
+        // reveals which stage the hook was in when it last completed successfully.
+        // Stages: 0=entry, 1=keyChecks, 2=GST, 3=modeChange, 4=handlers, 99=done
+        private static int _breadcrumb;
 
         internal static void EnsureStarted()
         {
@@ -171,6 +230,120 @@ namespace SRWYAccess
             {
                 DebugHelper.Write($"Thread start error: {ex}");
             }
+        }
+
+        // ===== Native Hook for InputManager.Update() =====
+        // IL2CPP instance methods use: void fn(IntPtr thisPtr, IntPtr methodInfo)
+        [UnmanagedFunctionPointer(CallingConvention.Cdecl)]
+        private delegate void d_InputManagerUpdate(IntPtr thisPtr, IntPtr methodInfo);
+
+        private static d_InputManagerUpdate _origUpdate;
+        private static d_InputManagerUpdate _hookDelegate;
+        private static GCHandle _hookGcHandle; // prevent GC collection of delegate
+        private static int _hookCallCount;
+        private static NativeDetour _nativeDetour; // inline hook (patches actual machine code)
+
+        private static unsafe bool TryNativeHook()
+        {
+            IntPtr classPtr = Il2CppClassPointerStore<InputManager>.NativeClassPtr;
+            DebugHelper.Write($"NativeHook: classPtr=0x{classPtr:X}");
+
+            if (classPtr == IntPtr.Zero)
+            {
+                DebugHelper.Write("NativeHook: InputManager class pointer is zero");
+                return false;
+            }
+
+            // Get the Il2CppMethodInfo* for InputManager.Update()
+            IntPtr methodInfoPtr = IL2CPP.GetIl2CppMethod(
+                classPtr, false, "Update", "System.Void");
+
+            if (methodInfoPtr == IntPtr.Zero)
+            {
+                DebugHelper.Write("NativeHook: GetIl2CppMethod returned zero");
+                return false;
+            }
+
+            DebugHelper.Write($"NativeHook: methodInfo=0x{methodInfoPtr:X}");
+
+            // Il2CppMethodInfo.methodPointer is at offset 0
+            IntPtr originalFnPtr = *(IntPtr*)methodInfoPtr;
+            DebugHelper.Write($"NativeHook: original fn=0x{originalFnPtr:X}");
+
+            if (originalFnPtr == IntPtr.Zero)
+            {
+                DebugHelper.Write("NativeHook: method pointer is zero");
+                return false;
+            }
+
+            // Create our hook delegate and pin it to prevent GC
+            _hookDelegate = new d_InputManagerUpdate(NativeUpdateHook);
+            _hookGcHandle = GCHandle.Alloc(_hookDelegate);
+            IntPtr hookFnPtr = Marshal.GetFunctionPointerForDelegate(_hookDelegate);
+
+            DebugHelper.Write($"NativeHook: hook fn=0x{hookFnPtr:X}");
+
+            // Use NativeDetour for inline hooking - patches actual machine code bytes
+            // at the start of the native function with a JMP to our hook.
+            // This is immune to vtable resets or Il2CppMethodInfo pointer overwrites.
+            _nativeDetour = new NativeDetour(originalFnPtr, hookFnPtr);
+            _origUpdate = _nativeDetour.GenerateTrampoline<d_InputManagerUpdate>();
+
+            DebugHelper.Write("NativeHook: NativeDetour applied (inline hook)");
+            DebugHelper.Flush();
+            return true;
+        }
+
+        private static void NativeUpdateHook(IntPtr thisPtr, IntPtr methodInfo)
+        {
+            // Call original InputManager.Update()
+            // Guard against race condition: NativeDetour patches native code before
+            // GenerateTrampoline completes. If the game thread fires Update() in
+            // between, _origUpdate is still null.
+            var orig = _origUpdate;
+            if (orig == null) return;
+            _breadcrumb = 5; // about to call original InputManager.Update()
+            orig(thisPtr, methodInfo);
+            _breadcrumb = 6; // original InputManager.Update() returned OK
+
+            // Diagnostic: log first few hook calls + periodic alive confirmation
+            _hookCallCount++;
+            if (_hookCallCount <= 3)
+            {
+                DebugHelper.Write($"NativeHook fired #{_hookCallCount}");
+                DebugHelper.Flush();
+            }
+            else if (_hookCallCount % 18000 == 0) // ~5 minutes at 60fps
+            {
+                DebugHelper.Write($"NativeHook alive: {_hookCallCount} calls");
+                DebugHelper.Flush();
+            }
+
+            // Run mod logic on main thread
+            try
+            {
+                OnMainThreadUpdate();
+            }
+            catch (Exception ex)
+            {
+                _criticalErrors++;
+                DebugHelper.Write($"MainThread CRITICAL ERROR #{_criticalErrors}: {ex.GetType().Name}: {ex.Message}");
+                DebugHelper.Write($"Stack: {ex.StackTrace}");
+                DebugHelper.Flush();
+
+                if (_criticalErrors >= SAFE_MODE_THRESHOLD && !_safeMode)
+                {
+                    _safeMode = true;
+                    DebugHelper.Write("*** ENTERING SAFE MODE: Too many critical errors ***");
+                    DebugHelper.Flush();
+                    try
+                    {
+                        ScreenReaderOutput.Say(Loc.Get("safe_mode_enabled"));
+                    }
+                    catch { }
+                }
+            }
+
         }
 
         private static bool IsIl2CppInteropReady()
@@ -290,6 +463,22 @@ namespace SRWYAccess
                 DebugHelper.Write("WARNING: Il2CppInterop runtime never became ready. Continuing with caution...");
             }
 
+            // Phase 5.5: Initialize SEH-protected native call wrappers
+            try
+            {
+                SafeCall.Initialize();
+                DebugHelper.Write($"SafeCall initialized: available={SafeCall.IsAvailable}, fields={SafeCall.FieldsAvailable}");
+                if (SafeCall.IsAvailable)
+                {
+                    ModConfig.ApplySEHTimings();
+                    DebugHelper.Write("Applied SEH-optimized timings");
+                }
+            }
+            catch (Exception ex)
+            {
+                DebugHelper.Write($"SafeCall init error: {ex.Message} (continuing without SEH protection)");
+            }
+
             // Phase 6: Wait for InputManager to exist in the scene
             DebugHelper.Write("Looking for InputManager (FindObjectOfType)...");
             bool singletonReady = false;
@@ -328,6 +517,7 @@ namespace SRWYAccess
             try
             {
                 Loc.Initialize();
+                AudioCueManager.Initialize();
                 GameStateTracker.Initialize();
                 _genericMenuReader = new GenericMenuReader();
                 _dialogHandler = new DialogHandler();
@@ -335,7 +525,10 @@ namespace SRWYAccess
                 _adventureDialogueHandler = new AdventureDialogueHandler();
                 _battleSubtitleHandler = new BattleSubtitleHandler();
                 _battleResultHandler = new BattleResultHandler();
+                _mapWeaponTargetHandler = new MapWeaponTargetHandler();
                 _tacticalMapHandler = new TacticalMapHandler();
+                _unitDistanceHandler = new UnitDistanceHandler();
+                _supporterHandler = new SupporterHandler();
                 _screenReviewManager = new ScreenReviewManager(
                     _genericMenuReader, _dialogHandler, _tutorialHandler,
                     _adventureDialogueHandler, _battleSubtitleHandler,
@@ -349,33 +542,51 @@ namespace SRWYAccess
                 return;
             }
 
-            // Phase 8: Create MonoBehaviour on main thread via ClassInjector
-            // Unity's Update() is called from native C++ directly on IL2CPP methods,
-            // so Harmony patches on proxy Update() methods don't fire.
-            // ClassInjector registers a real IL2CPP type that Unity can call Update() on.
+            // Phase 8: Hook InputManager.Update() at native level
             try
             {
-                ClassInjector.RegisterTypeInIl2Cpp<ModUpdateBehaviour>();
-                DebugHelper.Write("ClassInjector: ModUpdateBehaviour registered.");
-
-                var go = new GameObject("SRWYAccess_Update");
-                UnityEngine.Object.DontDestroyOnLoad(go);
-                go.hideFlags = HideFlags.HideAndDontSave;
-                go.AddComponent<ModUpdateBehaviour>();
-                DebugHelper.Write("ModUpdateBehaviour attached to GameObject.");
+                if (!TryNativeHook())
+                {
+                    DebugHelper.Write("Native hook failed. Aborting.");
+                    DebugHelper.Flush();
+                    return;
+                }
             }
             catch (Exception ex)
             {
-                DebugHelper.Write($"ClassInjector/GameObject setup FAILED: {ex}");
+                DebugHelper.Write($"Native hook FAILED: {ex}");
                 DebugHelper.Flush();
                 return;
             }
+
+            // Phase 8.5: Register global exception handler
+            AppDomain.CurrentDomain.UnhandledException += (s, e) =>
+            {
+                try
+                {
+                    var ex = e.ExceptionObject as Exception;
+                    string msg = ex != null
+                        ? $"Unhandled: {ex.GetType().Name}: {ex.Message}\n{ex.StackTrace}"
+                        : $"Unhandled non-Exception object: {e.ExceptionObject}";
+                    DebugHelper.Write("FATAL: " + msg);
+                    DebugHelper.Flush();
+                    // Attempt to notify user (may fail if Tolk is already shut down)
+                    try
+                    {
+                        ScreenReaderOutput.Say(Loc.Get("mod_critical_error"));
+                    }
+                    catch { }
+                }
+                catch { }
+            };
+            DebugHelper.Write("Global exception handler registered.");
 
             // Register shutdown handler
             AppDomain.CurrentDomain.ProcessExit += (s, e) =>
             {
                 _initialized = false;
                 _shutdownRequested = true;
+                SafeCall.Shutdown();
                 ScreenReaderOutput.Shutdown();
                 DebugHelper.Close();
             };
@@ -400,46 +611,147 @@ namespace SRWYAccess
         }
 
         /// <summary>
-        /// Called every frame from ModUpdateBehaviour.Update().
+        /// Called every frame from NativeUpdateHook (native hook on InputManager.Update).
         /// Runs on Unity main thread - all IL2CPP access is safe.
         /// </summary>
         internal static void OnMainThreadUpdate()
         {
             if (!_initialized || _shutdownRequested) return;
 
+            // Mod hotkeys: F2 toggle, F3 reload - checked every frame, even when disabled
+            CheckModHotkeys();
+
+            if (!_modEnabled) return;
+
+            // Transition blackout: skip ALL mod logic (including GST.Update(), key checks,
+            // handler updates) to minimize interference during dangerous scene transitions.
+            // Only F2/F3 hotkeys still work (checked above).
+            if (_transitionBlackout > 0)
+            {
+                _transitionBlackout--;
+                return;
+            }
+
+            // Don't reset _breadcrumb here: heartbeat logs the PREVIOUS poll's final stage.
+            // On crash, the last heartbeat breadcrumb reveals what completed before the crash.
             _frameCount++;
 
-            // Check review keys every frame for instant response
-            CheckReviewKeys();
-
-            // Throttle handler updates to every PollFrameInterval frames (~100ms at 60fps)
-            if (_frameCount % ModConfig.PollFrameInterval != 0) return;
-
-            // Heartbeat
-            _heartbeat++;
-            if (_heartbeat % ModConfig.HeartbeatInterval == 0)
+            // Safe mode: only handle basic functionality
+            if (_safeMode)
             {
-                DebugHelper.Write($"Heartbeat #{_heartbeat / ModConfig.HeartbeatInterval}: mode={_lastKnownMode}, postTitle={_postTitle}, postTactical={_postTactical}, resultPending={_resultPending}");
+                // In safe mode, only allow screen reader output and key checks
+                // Disable all handler updates to prevent further crashes
+                CheckReviewKeys();  // Basic screen review still works
+                return;
+            }
+
+            // ===== Battle warmup: two-phase protection =====
+            // Phase 1 (polls 0-5): Complete silence. No SafeCall, no handlers.
+            // Phase 2 (polls 6-20): Subtitle-only. BattleSubtitleHandler runs
+            //   but GST.Update() and key checks are skipped. This avoids VEH
+            //   overhead during the game engine's heavy initialization window
+            //   (observed: game drops to ~5fps at polls 6-10, VEH calls interfere).
+            // Phase 3 (poll 21+): Full operation. GST, keys, all handlers.
+            if (_lastKnownMode == InputManager.InputMode.BATTLE_SCENE && _battlePoll <= ModConfig.BattleWarmupPolls)
+            {
+                if (_frameCount % ModConfig.PollFrameInterval != 0) return;
+                _battlePoll++;
+                return;
+            }
+
+            if (_lastKnownMode == InputManager.InputMode.BATTLE_SCENE && _battlePoll <= 20)
+            {
+                if (_frameCount % ModConfig.PollFrameInterval != 0) return;
+                if (_battlePoll == ModConfig.BattleWarmupPolls + 1)
+                {
+                    DebugHelper.Write($"Battle phase 2: subtitle-only (poll={_battlePoll})");
+                    DebugHelper.Flush();
+                }
+                _battlePoll++;
+                if (_battlePoll % 2 == 0)
+                    _battleSubtitleHandler?.Update(false, _battlePoll);
+                return;
+            }
+
+            // Throttle all mod logic to poll frames. Interactive modes use faster
+            // interval (~33ms) for snappier response. Standard interval during
+            // BATTLE_SCENE, guard mode, and NONE-loading (no interactive UI needs
+            // fast response during scene transitions - reduces SafeCall frequency).
+            // Key checks also run on poll frames only (33ms response is imperceptible
+            // for keyboard input, but saves 11 GetAsyncKeyState kernel transitions
+            // per non-poll frame).
+            bool isNoneTransition = _lastKnownMode == InputManager.InputMode.NONE
+                && !_postTitle && !_postTactical && !_postAdventure && !_noneProbeActive;
+            bool useFastPoll = !GameStateTracker.IsInGuardMode
+                && !isNoneTransition
+                && _lastKnownMode != InputManager.InputMode.BATTLE_SCENE;
+            int pollInterval = useFastPoll
+                ? ModConfig.FastPollFrameInterval
+                : ModConfig.PollFrameInterval;
+            if (_frameCount % pollInterval != 0) return;
+
+            // Key checks on poll frames (skip during guard mode - no interactive UI)
+            if (!GameStateTracker.IsInGuardMode)
+            {
+                CheckReviewKeys();
+                CheckDistanceKeys();
+
+                CheckRangeKeys();
+                CheckTabSwitchKeys();
+            }
+
+            // CRITICAL: Timing-critical counters (_searchCooldown, _noneLoadingCount,
+            // _heartbeat) were calibrated for PollFrameInterval (4 frames). With fast
+            // polling (2 frames), they'd expire in half the intended time, causing
+            // premature access to transitioning scene objects. Only decrement/increment
+            // these counters on standard ticks to maintain correct timing.
+            bool isStandardTick = (_frameCount % ModConfig.PollFrameInterval == 0);
+
+            // Heartbeat - _breadcrumb still holds value from LAST poll frame
+            // (99 if completed, or lower if crash happened mid-cycle)
+            if (isStandardTick)
+            {
+                _heartbeat++;
+                if (_heartbeat % ModConfig.HeartbeatInterval == 0)
+                {
+                    var gcr = SafeCall.GameCrashRecoveries;
+                    DebugHelper.Write($"Heartbeat #{_heartbeat / ModConfig.HeartbeatInterval}: mode={_lastKnownMode}, postTitle={_postTitle}, postTactical={_postTactical}, postAdv={_postAdventure}, resultPending={_resultPending}, bc={_breadcrumb}{(gcr > 0 ? $", gameCrashRecoveries={gcr}" : "")}");
+                    DebugHelper.Flush();
+                }
             }
 
             // Update game state (safe on main thread)
+            _breadcrumb = 10; // GST update
             GameStateTracker.Update();
 
             // NoModeMatched: behaviour pointer changed but no InputMode recognized
             if (GameStateTracker.NoModeMatched)
             {
+                _isInLoadingState = true;
                 _noneLoadingCount = 0;
                 if (_postTactical || _postTitle || _noneProbeActive)
                 {
                     _searchCooldown = Math.Max(_searchCooldown, 1);
                     DebugHelper.Write("NoModeMatched in menu state, short cooldown");
                 }
-                else
+                else if (_searchCooldown == 0)
                 {
-                    _searchCooldown = Math.Max(_searchCooldown, ModConfig.NoneProbeThreshold);
+                    // Only set full cooldown if not already counting down.
+                    // Repeated NoModeMatched events during guard mode no longer
+                    // restart the countdown, preventing compounded delays.
+                    _searchCooldown = ModConfig.NoneProbeThresholdEffective;
                 }
+                DebugHelper.Flush();
                 return;
             }
+
+            // Guard mode active: scene is transitioning, IL2CPP objects may be
+            // partially destroyed. Skip ALL handler updates (FindObjectsOfType,
+            // cursor reads, TMP text reads) to prevent uncatchable AV.
+            // Guard warmup resets NoModeMatched to false (above check misses it),
+            // so this explicit check catches the remaining guard cycles.
+            if (GameStateTracker.IsInGuardMode)
+                return;
 
             // Behaviour pointer changed within same mode
             if (GameStateTracker.BehaviourJustChanged)
@@ -447,39 +759,93 @@ namespace SRWYAccess
 
             var currentMode = GameStateTracker.CurrentMode;
 
+            // Post-guard: reset _noneLoadingCount so NONE probe doesn't fire
+            // immediately after guard exits. Adds ~1s of safety (threshold cycles).
+            if (GameStateTracker.GuardJustExited)
+                _noneLoadingCount = 0;
+
+            // Post-guard immediate probe: guard mode confirmed pointer stability
+            // for ~1s. If we're in NONE without flags, immediately check for
+            // active UI handlers instead of waiting for NoneProbeThreshold.
+            if (GameStateTracker.GuardJustExited && currentMode == InputManager.InputMode.NONE
+                && !_postTitle && !_postTactical && !_postAdventure)
+            {
+                // Throttle FOT calls: minimum 30 frames (~500ms) between calls
+                if (_frameCount - _lastFOTFrame >= FOT_MIN_INTERVAL)
+                {
+                    try
+                    {
+                        var handlers = UnityEngine.Object.FindObjectsOfType<UIHandlerBase>();
+                        _lastFOTFrame = _frameCount;
+                        if (handlers != null && handlers.Count > 0)
+                        {
+                            DebugHelper.Write($"Post-guard probe: found {handlers.Count} handlers, activating");
+                            _postTactical = true;
+                            _noneProbeActive = true;
+                            _noneLoadingCount = 0;
+                            _searchCooldown = ModConfig.SearchCooldownEffective;
+                        }
+                    }
+                    catch (Exception ex)
+                    {
+                        DebugHelper.Write($"Post-guard probe error: {ex.GetType().Name}");
+                    }
+                }
+            }
+
             // Mode change
             if (currentMode != _lastKnownMode)
             {
+                var previousMode = _lastKnownMode;
                 DebugHelper.Write($"GameState: {_lastKnownMode} -> {currentMode}");
+                DebugHelper.Flush();
                 HandleModeChange(currentMode);
 
                 // Special case: resultPending + tactical = skip cooldown for result detection
                 if (GameStateTracker.IsTacticalMode(currentMode) && _resultPending)
                 {
                     _lastKnownMode = currentMode;
-                    _searchCooldown = ModConfig.SearchCooldownAfterChange;
+                    _searchCooldown = ModConfig.SearchCooldownEffective;
                     // Don't return - let handlers run for result polling
                 }
                 else
                 {
                     _lastKnownMode = currentMode;
-                    _searchCooldown = ModConfig.SearchCooldownAfterChange;
+                    // Scene transitions involving ADVENTURE involve a full scene
+                    // destroy + load. Use extended cooldown to let Unity finish before
+                    // handlers run FindObjectsOfType (partially-destroyed objects can
+                    // cause uncatchable AV on property access in .NET 6).
+                    // ADVENTURE -> NONE is equally dangerous: adventure scene objects
+                    // are destroyed and the NONE probe's FindObjectsOfType can hit
+                    // partially-freed UIHandlerBase objects.
+                    if (currentMode == InputManager.InputMode.ADVENTURE
+                        || previousMode == InputManager.InputMode.ADVENTURE)
+                        _searchCooldown = ModConfig.AdventureTransitionCooldownEffective;
+                    else if (GameStateTracker.IsTacticalMode(previousMode)
+                        && currentMode == InputManager.InputMode.NONE)
+                        _searchCooldown = ModConfig.TacticalTransitionCooldownEffective;
+                    else
+                        _searchCooldown = ModConfig.SearchCooldownEffective;
+                    _isInLoadingState = true; // block review keys during mode change settle
                     _screenReviewManager?.Clear();
+                    DebugHelper.Flush();
                     return; // Let scene settle
                 }
             }
 
-            // Search cooldown
+            _breadcrumb = 20; // mode change handled
+
+            // Search cooldown (decrement at standard rate to preserve calibrated timing)
             bool searchAllowed = true;
             if (_searchCooldown > 0)
             {
-                _searchCooldown--;
+                if (isStandardTick) _searchCooldown--;
                 searchAllowed = false;
             }
 
             // Loading state detection
             bool isNoneLoading = currentMode == InputManager.InputMode.NONE
-                && !_postTitle && !_postTactical;
+                && !_postTitle && !_postTactical && !_postAdventure;
             bool isLoadingState = currentMode == InputManager.InputMode.LOGO
                 || currentMode == InputManager.InputMode.ENTRY
                 || currentMode == InputManager.InputMode.TITLE
@@ -487,10 +853,14 @@ namespace SRWYAccess
 
             if (isNoneLoading)
             {
-                _noneLoadingCount++;
-                // NONE probe: detect if game is running despite NONE mode
-                if (searchAllowed && _noneLoadingCount >= ModConfig.NoneProbeThreshold
-                    && _noneLoadingCount % ModConfig.NoneProbeThreshold == 0)
+                if (isStandardTick) _noneLoadingCount++;
+                // NONE probe: detect if game is running despite NONE mode.
+                // CRITICAL: Suppress during guard mode. Guard mode means GST is monitoring
+                // a scene transition (e.g. ADVENTURE→NONE). FindObjectsOfType during this
+                // window can hit partially-destroyed scene objects → uncatchable AV.
+                if (searchAllowed && !GameStateTracker.IsInGuardMode
+                    && _noneLoadingCount >= ModConfig.NoneProbeThresholdEffective
+                    && _noneLoadingCount % ModConfig.NoneProbeThresholdEffective == 0)
                 {
                     if (GameStateTracker.BehaviourJustChanged)
                     {
@@ -506,20 +876,24 @@ namespace SRWYAccess
                         return;
                     }
 
-                    // Still NONE - check for active UI handlers
-                    try
+                    // Still NONE - check for active UI handlers (with throttling)
+                    if (_frameCount - _lastFOTFrame >= FOT_MIN_INTERVAL)
                     {
-                        var handlers = UnityEngine.Object.FindObjectsOfType<UIHandlerBase>();
-                        if (handlers != null && handlers.Count > 0)
+                        try
                         {
-                            DebugHelper.Write($"NONE probe: found {handlers.Count} active UIHandlers, treating as active");
-                            _postTactical = true;
-                            _noneProbeActive = true;
-                            isLoadingState = false;
-                            _noneLoadingCount = 0;
+                            var handlers = UnityEngine.Object.FindObjectsOfType<UIHandlerBase>();
+                            _lastFOTFrame = _frameCount;
+                            if (handlers != null && handlers.Count > 0)
+                            {
+                                DebugHelper.Write($"NONE probe: found {handlers.Count} active UIHandlers, treating as active");
+                                _postTactical = true;
+                                _noneProbeActive = true;
+                                isLoadingState = false;
+                                _noneLoadingCount = 0;
+                            }
                         }
+                        catch { }
                     }
-                    catch { }
                 }
             }
             else
@@ -527,8 +901,10 @@ namespace SRWYAccess
                 _noneLoadingCount = 0;
             }
 
+            _isInLoadingState = isLoadingState;
             if (isLoadingState) return;
 
+            _breadcrumb = 30; // entering handler updates
             // ===== Handler updates =====
             bool isBattle = currentMode == InputManager.InputMode.BATTLE_SCENE;
             bool isAdventure = currentMode == InputManager.InputMode.ADVENTURE;
@@ -536,77 +912,110 @@ namespace SRWYAccess
 
             if (isBattle)
             {
+                _breadcrumb = 50; // battle path entry
                 _battlePoll++;
+                if (_battleSceneDiag > 0)
+                {
+                    DebugHelper.Write($"BATTLE_DIAG: handler update, battlePoll={_battlePoll}");
+                    DebugHelper.Flush();
+                }
+                // Poll subtitles every 2nd cycle (~133ms)
                 if (_battlePoll % 2 == 0)
                 {
-                    // Re-check mode (battle can end mid-frame sequence)
-                    GameStateTracker.Update();
-                    if (GameStateTracker.CurrentMode != InputManager.InputMode.BATTLE_SCENE)
-                        return;
-                    if (GameStateTracker.BehaviourJustChanged)
-                        return;
-                    bool readStats = (_battlePoll % 30 == 0);
-                    _battleSubtitleHandler?.Update(readStats);
+                    _breadcrumb = 51; // subtitle handler about to run
+                    bool readStats = (_battlePoll % 32 == 0); // stats every ~2s (aligned with %2), reduced for stability
+                    _battleSubtitleHandler?.Update(readStats, _battlePoll);
+                    _breadcrumb = 52; // subtitle handler done
                 }
             }
             else
             {
                 _battlePoll = 0;
 
-                // GenericMenuReader
-                bool canSearchMenu = searchAllowed && (_searchSlot == 0) && !isAdventure;
+                // GenericMenuReader (safe on main thread, including during ADVENTURE)
+                _breadcrumb = 41; // GenericMenuReader
+                bool canSearchMenu = searchAllowed && (_searchSlot == 0);
                 bool menuLost = _genericMenuReader?.Update(canSearchMenu) ?? false;
 
+                // Sort/filter text monitoring (reads TMP from list handlers)
+                _genericMenuReader?.CheckSortFilterText();
+
+                // Supporter handler (MonoBehaviour-based, not found by GenericMenuReader)
+                _supporterHandler?.Update(canSearchMenu);
+
+                _breadcrumb = 42; // GenericMenuReader done
                 if (menuLost)
                 {
+                    // Keep _postTitle and _postTactical flags on handler loss.
+                    // They suppress the NONE probe's FindObjectsOfType which can crash
+                    // on partially-destroyed objects during transitions (e.g. battle check
+                    // → battle scene). Flags are cleared when a non-NONE mode is detected.
                     if (currentMode == InputManager.InputMode.NONE)
                     {
                         if (_postTitle)
-                        {
-                            _postTitle = false;
-                            DebugHelper.Write("Menu lost in postTitle NONE: cleared");
-                        }
+                            DebugHelper.Write("Menu lost in postTitle NONE (flag kept)");
                         if (_postTactical)
-                        {
-                            _postTactical = false;
-                            _noneProbeActive = false;
-                            DebugHelper.Write("Menu lost in postTactical NONE: cleared");
-                        }
+                            DebugHelper.Write("Menu lost in postTactical NONE (flag kept)");
                     }
-                    _searchCooldown = ModConfig.SearchCooldownAfterChange;
+                    _searchCooldown = ModConfig.SearchCooldownEffective;
                     _screenReviewManager?.Clear();
                     ReleaseUIHandlers();
                     return;
                 }
 
                 // Dialog handler
+                _breadcrumb = 43; // DialogHandler
                 _dialogHandler?.Update();
 
                 if (isAdventure)
                 {
-                    _tutorialHandler?.Update(false);
-                    _adventureDialogueHandler?.Update(searchAllowed && _searchSlot == 2);
+                    // Tutorial search now safe on main thread (was disabled for bg thread)
+                    _tutorialHandler?.Update(searchAllowed && _searchSlot == 1);
+                    // Adventure dialogue: search every poll cycle (not just slot 2) for
+                    // faster subtitle discovery. FindDialogueObjects batches all 5 types
+                    // in one call, so the per-frame cost is acceptable.
+                    _adventureDialogueHandler?.Update(searchAllowed);
 
                     if (_adventureDialogueHandler?.RefsJustReleased == true)
                     {
                         _adventureDialogueHandler.RefsJustReleased = false;
                         DebugHelper.Write("ADH refs released: cooldown for scene transition");
-                        _searchCooldown = ModConfig.SearchCooldownAfterChange;
+                        _searchCooldown = ModConfig.AdventureTransitionCooldownEffective;
                         _screenReviewManager?.Clear();
-                        ReleaseUIHandlers();
+                        // Release other handlers but NOT ADH - it already released its own
+                        // refs via ReleaseDialogueRefs() with _searchCooldown=23.
+                        // Calling ReleaseUIHandlers() would call ADH.ReleaseHandler()
+                        // which resets _searchCooldown to 0, allowing immediate re-search
+                        // of partially-destroyed scene objects → AV crash.
+                        _genericMenuReader?.ReleaseHandler();
+                        _dialogHandler?.ReleaseHandler();
+                        _tutorialHandler?.ReleaseHandler();
+                        _battleSubtitleHandler?.ReleaseHandler();
+                        _tacticalMapHandler?.ReleaseHandler();
+                        _unitDistanceHandler?.ReleaseHandler();
+                        _supporterHandler?.ReleaseHandler();
                         return;
                     }
 
-                    PollBattleResult();
+                    if (isStandardTick) PollBattleResult();
                 }
                 else
                 {
+                    _breadcrumb = 44; // Tutorial+Result
                     bool canSearchTutorial = searchAllowed && _searchSlot == 1 && !_noneProbeActive;
                     _tutorialHandler?.Update(canSearchTutorial);
-                    PollBattleResult();
+                    if (isStandardTick) PollBattleResult();
+
+                    // Turn summary: count actionable units after enemy turn ends
+                    if (_pendingTurnSummary && searchAllowed)
+                    {
+                        _pendingTurnSummary = false;
+                        AnnounceTurnSummary();
+                    }
 
                     if (currentMode == InputManager.InputMode.TACTICAL_PART)
                     {
+                        _breadcrumb = 45; // TacticalMap
                         _tacticalMapHandler?.Update(searchAllowed && _searchSlot == 2);
                     }
                     else if (currentMode == InputManager.InputMode.TACTICAL_PART_BUTTON_UI
@@ -616,12 +1025,21 @@ namespace SRWYAccess
                     {
                         _tacticalMapHandler?.UpdateUnitOnly(searchAllowed && _searchSlot == 2);
                     }
+
+                    // MAP weapon target count (runs during all tactical modes;
+                    // handler itself checks for active PlayerAttackMapWeaponTask)
+                    _mapWeaponTargetHandler?.Update();
                 }
             }
+
+            _breadcrumb = 99; // completed successfully
+            DebugHelper.Flush(); // ensure handler results are written before potential crash
         }
 
         private static void HandleModeChange(InputManager.InputMode newMode)
         {
+            DebugHelper.Write($"HandleModeChange: {_lastKnownMode} -> {newMode}");
+
             if (_lastKnownMode == InputManager.InputMode.TITLE
                 && newMode == InputManager.InputMode.NONE)
             {
@@ -645,6 +1063,7 @@ namespace SRWYAccess
                 if (newMode != InputManager.InputMode.NONE)
                 {
                     _postTitle = false;
+                    _postAdventure = false;
                     _noneProbeActive = false;
                     if (!isTacticalSub)
                         _postTactical = false;
@@ -665,14 +1084,24 @@ namespace SRWYAccess
                 {
                     if (newMode == InputManager.InputMode.BATTLE_SCENE)
                     {
+                        _battleSceneDiag = 0; // DISABLED: diagnostic logging causes I/O overhead (Crash #19)
+                        // DebugHelper.Write("BATTLE_DIAG: armed (600 frames)");
+                        // DebugHelper.Flush();
                         if (_resultPending)
                         {
                             _resultPending = false;
                             DebugHelper.Write("resultPending cleared (new battle)");
                         }
+                        // Preemptive guard for tactical→battle transition
+                        if (lastWasTactical)
+                        {
+                            GameStateTracker.EnterGuardMode();
+                            DebugHelper.Write("Guard mode: TACTICAL→BATTLE transition");
+                        }
                     }
                     else if (newMode == InputManager.InputMode.ADVENTURE)
                     {
+                        // ADV_DIAG disabled: diagnostic logging removed to reduce I/O overhead
                         if (_resultPending)
                         {
                             _resultPending = false;
@@ -682,6 +1111,60 @@ namespace SRWYAccess
 
                     if (!lastWasTactical || newMode != InputManager.InputMode.NONE)
                         ReleaseUIHandlers();
+                }
+
+                // Preemptive guard mode for major scene transitions.
+                // The game destroys scene objects during these transitions
+                // (adventure objects, map objects during enemy battle initiation),
+                // and subsequent GetInputBehaviour calls or FindObjectsOfType
+                // can hit freed native memory → uncatchable AccessViolationException.
+                if ((_lastKnownMode == InputManager.InputMode.ADVENTURE
+                    || lastWasTactical)
+                    && newMode == InputManager.InputMode.NONE)
+                {
+                    GameStateTracker.EnterGuardMode();
+                    // Blackout: skip ALL mod logic to avoid interfering during
+                    // scene destruction. Tactical→NONE uses shorter blackout
+                    // (~167ms) since command menus are lightweight UI overlays.
+                    // Adventure→NONE uses longer blackout (~1s) for heavy
+                    // scene transitions (full scene destroy + load).
+                    _transitionBlackout = lastWasTactical
+                        ? ModConfig.TacticalBlackoutFrames  // ~167ms
+                        : 60;                               // ~1s
+                    // Crash #28: ADVENTURE→NONE must suppress the NONE probe.
+                    // The game's scene objects are still being cleaned up for
+                    // several seconds after the mode change. FindObjectsOfType
+                    // during this window hits partially-freed objects → AV at
+                    // GameAssembly.dll+0x338959. Unlike tactical→NONE (which
+                    // needs the probe for command menus), adventure→NONE always
+                    // transitions to another mode (tactical/adventure) detected
+                    // naturally by GST.
+                    if (_lastKnownMode == InputManager.InputMode.ADVENTURE)
+                    {
+                        _postAdventure = true;
+                        DebugHelper.Write("Adventure -> NONE: postAdventure mode (NONE probe suppressed)");
+                    }
+                }
+                // Guard mode for ANY major → ADVENTURE transition.
+                // The game destroys previous scene objects while loading adventure
+                // objects. Without guard, GST runs the 17-mode detection loop and
+                // handlers call FindObjectOfType on partially-freed objects.
+                // Crash #28b: TACTICAL→ADVENTURE was unprotected, causing AV at
+                // GameAssembly.dll+0x338959 ~2.2s after transition.
+                if (newMode == InputManager.InputMode.ADVENTURE
+                    && (_lastKnownMode == InputManager.InputMode.NONE
+                        || _lastKnownMode == InputManager.InputMode.BATTLE_SCENE
+                        || lastWasTactical))
+                {
+                    GameStateTracker.EnterGuardMode();
+                }
+
+                // Turn summary: enemy turn → player turn
+                if (_lastKnownMode == InputManager.InputMode.TACTICAL_PART_NON_PLAYER_TURN
+                    && newMode == InputManager.InputMode.TACTICAL_PART)
+                {
+                    _pendingTurnSummary = true;
+                    DebugHelper.Write("Turn summary pending (enemy → player)");
                 }
 
                 DebugHelper.Write($"State change to {newMode}");
@@ -696,6 +1179,9 @@ namespace SRWYAccess
             _adventureDialogueHandler?.ReleaseHandler();
             _battleSubtitleHandler?.ReleaseHandler();
             _tacticalMapHandler?.ReleaseHandler();
+            _unitDistanceHandler?.ReleaseHandler();
+            _supporterHandler?.ReleaseHandler();
+            _mapWeaponTargetHandler?.Reset();
             if (!keepResultHandler)
                 _battleResultHandler?.ReleaseHandler();
         }
@@ -716,9 +1202,180 @@ namespace SRWYAccess
                 _battleResultHandler.Update();
         }
 
+        /// <summary>
+        /// Count actionable player units and announce turn summary.
+        /// Uses TacticalBoard.GetAllPawns() with SafeCall protection.
+        /// Called after searchCooldown expires to ensure stable scene.
+        /// </summary>
+        private static void AnnounceTurnSummary()
+        {
+            try
+            {
+                var mm = MapManager.Instance;
+                if ((object)mm == null || mm.Pointer == IntPtr.Zero) goto fallback;
+                if (!SafeCall.ProbeObject(mm.Pointer)) goto fallback;
+
+                TacticalBoard board;
+                try { board = mm.TacticalBoard; }
+                catch { goto fallback; }
+                if ((object)board == null) goto fallback;
+                if (!SafeCall.ProbeObject(board.Pointer)) goto fallback;
+
+                Il2CppSystem.Collections.Generic.List<PawnUnit> allPawns;
+                try { allPawns = board.GetAllPawns(); }
+                catch { goto fallback; }
+                if ((object)allPawns == null) goto fallback;
+
+                int count;
+                try { count = allPawns.Count; }
+                catch { goto fallback; }
+
+                int totalPlayer = 0;
+                int actionable = 0;
+
+                for (int i = 0; i < count; i++)
+                {
+                    try
+                    {
+                        var pu = allPawns[i];
+                        if ((object)pu == null || pu.Pointer == IntPtr.Zero) continue;
+                        if (!SafeCall.ProbeObject(pu.Pointer)) continue;
+
+                        // Check if player side
+                        bool playerSide;
+                        if (SafeCall.PawnMethodsAvailable)
+                        {
+                            var (ok, val) = SafeCall.ReadIsPlayerSideSafe(pu.Pointer);
+                            if (!ok) continue;
+                            playerSide = val;
+                        }
+                        else
+                        {
+                            try { playerSide = pu.IsPlayerSide; }
+                            catch { continue; }
+                        }
+                        if (!playerSide) continue;
+
+                        // Check if alive
+                        bool alive;
+                        if (SafeCall.PawnMethodsAvailable)
+                        {
+                            var (ok, val) = SafeCall.ReadIsAliveSafe(pu.Pointer);
+                            if (!ok) continue;
+                            alive = val;
+                        }
+                        else
+                        {
+                            try { alive = pu.IsAlive; }
+                            catch { continue; }
+                        }
+                        if (!alive) continue;
+
+                        totalPlayer++;
+
+                        // Check if can still act
+                        try
+                        {
+                            Pawn pawnData = null;
+                            if (SafeCall.PawnMethodsAvailable)
+                            {
+                                IntPtr pdPtr = SafeCall.ReadPawnDataSafe(pu.Pointer);
+                                if (pdPtr != IntPtr.Zero && SafeCall.ProbeObject(pdPtr))
+                                    pawnData = new Pawn(pdPtr);
+                            }
+                            if ((object)pawnData != null)
+                            {
+                                if (pawnData.IsPossibleToAction())
+                                    actionable++;
+                            }
+                        }
+                        catch { }
+                    }
+                    catch { continue; }
+                }
+
+                string msg = Loc.Get("turn_summary", actionable, totalPlayer);
+                ScreenReaderOutput.Say(msg);
+                DebugHelper.Write($"Turn summary: {actionable}/{totalPlayer} actionable");
+                return;
+            }
+            catch (Exception ex)
+            {
+                DebugHelper.Write($"Turn summary error: {ex.GetType().Name}");
+            }
+
+            fallback:
+            ScreenReaderOutput.Say(Loc.Get("turn_summary_none"));
+        }
+
+        private static void CheckModHotkeys()
+        {
+            bool keyF2 = (GetAsyncKeyState(VK_F2) & 0x8000) != 0;
+            bool keyF3 = (GetAsyncKeyState(VK_F3) & 0x8000) != 0;
+
+            if (keyF2 && !_lastKeyF2)
+            {
+                _modEnabled = !_modEnabled;
+                string msg = _modEnabled ? Loc.Get("mod_enabled") : Loc.Get("mod_disabled");
+                ScreenReaderOutput.Say(msg);
+                DebugHelper.Write($"Mod toggled: enabled={_modEnabled}");
+                if (!_modEnabled)
+                {
+                    // Release all handler state when disabling
+                    ReleaseUIHandlers();
+                    _screenReviewManager?.Clear();
+                }
+            }
+
+            if (keyF3 && !_lastKeyF3 && _modEnabled)
+            {
+                ResetModState();
+                ScreenReaderOutput.Say(Loc.Get("mod_reset"));
+                DebugHelper.Write("Mod state reset via F3");
+            }
+
+            bool keyF4 = (GetAsyncKeyState(VK_F4) & 0x8000) != 0;
+            if (keyF4 && !_lastKeyF4)
+            {
+                ModConfig.AudioCuesEnabled = !ModConfig.AudioCuesEnabled;
+                string msg = ModConfig.AudioCuesEnabled ? Loc.Get("audio_cues_on") : Loc.Get("audio_cues_off");
+                ScreenReaderOutput.Say(msg);
+                DebugHelper.Write($"Audio cues toggled: enabled={ModConfig.AudioCuesEnabled}");
+            }
+
+            _lastKeyF2 = keyF2;
+            _lastKeyF3 = keyF3;
+            _lastKeyF4 = keyF4;
+        }
+
+        private static void ResetModState()
+        {
+            ReleaseUIHandlers();
+            _screenReviewManager?.Clear();
+            _searchCooldown = 0;
+            _noneLoadingCount = 0;
+            _postTitle = false;
+            _postTactical = false;
+            _postAdventure = false;
+            _noneProbeActive = false;
+            _resultPending = false;
+            _resultPoll = 0;
+            _resultTimeout = 0;
+            _battlePoll = 0;
+            _pendingTurnSummary = false;
+            _isInLoadingState = false;
+            _safeMode = false;
+            _transitionBlackout = 0;
+            // Re-detect current game state
+            GameStateTracker.Update();
+            _lastKnownMode = GameStateTracker.CurrentMode;
+        }
+
         private static void CheckReviewKeys()
         {
             if (_screenReviewManager == null) return;
+            // Block review during loading/transitions to prevent FOT on freed objects
+            if (_isInLoadingState || _searchCooldown > 0) return;
 
             var currentMode = GameStateTracker.CurrentMode;
             bool isBattle = currentMode == InputManager.InputMode.BATTLE_SCENE;
@@ -741,28 +1398,176 @@ namespace SRWYAccess
             _lastKeyLeft = keyLeft;
             _lastKeyRight = keyRight;
         }
-    }
 
-    /// <summary>
-    /// Custom MonoBehaviour injected via ClassInjector.
-    /// Unity calls Update() every frame on the main thread.
-    /// DontDestroyOnLoad keeps it alive across scene transitions.
-    /// </summary>
-    internal class ModUpdateBehaviour : MonoBehaviour
-    {
-        public ModUpdateBehaviour(IntPtr ptr) : base(ptr) { }
-
-        void Update()
+        /// <summary>
+        /// Check Q/E keys (L1/R1 tab switch). When pressed, force GenericMenuReader
+        /// to re-announce the current item since tab content changes without cursor move.
+        /// </summary>
+        private static void CheckTabSwitchKeys()
         {
-            try
+            if (_genericMenuReader == null || !_genericMenuReader.HasHandler) return;
+            if (_isInLoadingState || _searchCooldown > 0) return;
+
+            bool keyQ = (GetAsyncKeyState(VK_Q) & 0x8000) != 0;
+            bool keyE = (GetAsyncKeyState(VK_E) & 0x8000) != 0;
+            bool key1 = (GetAsyncKeyState(VK_1) & 0x8000) != 0;
+            bool key3 = (GetAsyncKeyState(VK_3) & 0x8000) != 0;
+
+            if ((keyQ && !_lastKeyQ) || (keyE && !_lastKeyE)
+                || (key1 && !_lastKey1) || (key3 && !_lastKey3))
+                _genericMenuReader.ForceReannounce();
+
+            _lastKeyQ = keyQ;
+            _lastKeyE = keyE;
+            _lastKey1 = key1;
+            _lastKey3 = key3;
+        }
+
+
+        /// <summary>
+        /// Check =/- keys (movement range / attack range).
+        /// Active during any tactical mode.
+        /// </summary>
+        private static void CheckRangeKeys()
+        {
+            if (_tacticalMapHandler == null) return;
+            if (_isInLoadingState || _searchCooldown > 0) return;
+
+            var currentMode = GameStateTracker.CurrentMode;
+            if (!GameStateTracker.IsTacticalMode(currentMode)
+                && !(currentMode == InputManager.InputMode.NONE && (_postTactical || _noneProbeActive)))
             {
-                ModCore.OnMainThreadUpdate();
+                _lastKeyEquals = false;
+                _lastKeyMinus = false;
+                return;
             }
-            catch (Exception ex)
+
+            bool keyEquals = (GetAsyncKeyState(VK_OEM_PLUS) & 0x8000) != 0;
+            if (keyEquals && !_lastKeyEquals)
+                _tacticalMapHandler.AnnounceMovementRange();
+            _lastKeyEquals = keyEquals;
+
+            bool keyMinus = (GetAsyncKeyState(VK_OEM_MINUS) & 0x8000) != 0;
+            if (keyMinus && !_lastKeyMinus)
+                _tacticalMapHandler.AnnounceAttackRange();
+            _lastKeyMinus = keyMinus;
+        }
+
+        /// <summary>
+        /// Check ;/' (enemy distance) and .// (ally distance) keys.
+        /// Only active during TACTICAL_PART mode (map navigation/movement).
+        /// </summary>
+        private static void CheckDistanceKeys()
+        {
+            if (_unitDistanceHandler == null) return;
+            if (_isInLoadingState || _searchCooldown > 0) return;
+
+            var currentMode = GameStateTracker.CurrentMode;
+            if (currentMode != InputManager.InputMode.TACTICAL_PART)
             {
-                DebugHelper.Write($"Main thread update error: {ex.GetType().Name}: {ex.Message}");
-                DebugHelper.Flush();
+                _lastKeySemicolon = false;
+                _lastKeyApostrophe = false;
+                _lastKeyPeriod = false;
+                _lastKeySlash = false;
+                _lastKeyBackslash = false;
+                return;
             }
+
+            // Get current cursor position from TacticalMapHandler
+            var cursorCoord = _tacticalMapHandler?.LastCoord ?? new Vector2Int(-999, -999);
+            if (cursorCoord.x == -999 && cursorCoord.y == -999)
+            {
+                _lastKeySemicolon = false;
+                _lastKeyApostrophe = false;
+                _lastKeyPeriod = false;
+                _lastKeySlash = false;
+                _lastKeyBackslash = false;
+                return;
+            }
+
+            bool keySemicolon = (GetAsyncKeyState(VK_OEM_1) & 0x8000) != 0;
+            bool keyApostrophe = (GetAsyncKeyState(VK_OEM_7) & 0x8000) != 0;
+            bool keyPeriod = (GetAsyncKeyState(VK_OEM_PERIOD) & 0x8000) != 0;
+            bool keySlash = (GetAsyncKeyState(VK_OEM_2) & 0x8000) != 0;
+            bool keyBackslash = (GetAsyncKeyState(VK_OEM_5) & 0x8000) != 0;
+            bool shiftHeld = (GetAsyncKeyState(VK_SHIFT) & 0x8000) != 0;
+            bool ctrlHeld = (GetAsyncKeyState(VK_CONTROL) & 0x8000) != 0;
+
+            if (keySemicolon && !_lastKeySemicolon)
+            {
+                if (_mapWeaponTargetHandler != null && _mapWeaponTargetHandler.IsActive)
+                {
+                    // ; in MAP weapon mode: read enemy names in range
+                    string names = _mapWeaponTargetHandler.ReadEnemyNames();
+                    if (!string.IsNullOrEmpty(names))
+                        ScreenReaderOutput.Say(names);
+                }
+                else
+                {
+                    string msg = _unitDistanceHandler.CycleEnemy(-1, cursorCoord);
+                    if (!string.IsNullOrEmpty(msg))
+                        ScreenReaderOutput.Say(msg);
+                }
+            }
+
+            if (keyApostrophe && !_lastKeyApostrophe)
+            {
+                if (_mapWeaponTargetHandler != null && _mapWeaponTargetHandler.IsActive)
+                {
+                    // ' in MAP weapon mode: read ally names in range
+                    string names = _mapWeaponTargetHandler.ReadAllyNames();
+                    if (!string.IsNullOrEmpty(names))
+                        ScreenReaderOutput.Say(names);
+                }
+                else
+                {
+                    string msg = _unitDistanceHandler.CycleEnemy(1, cursorCoord);
+                    if (!string.IsNullOrEmpty(msg))
+                        ScreenReaderOutput.Say(msg);
+                }
+            }
+
+            // . key: Shift=unacted, Ctrl=acted, plain=ally distance
+            if (keyPeriod && !_lastKeyPeriod)
+            {
+                string msg;
+                if (shiftHeld)
+                    msg = _unitDistanceHandler.CycleUnacted(-1, cursorCoord);
+                else if (ctrlHeld)
+                    msg = _unitDistanceHandler.CycleActed(-1, cursorCoord);
+                else
+                    msg = _unitDistanceHandler.CycleAlly(-1, cursorCoord);
+                if (!string.IsNullOrEmpty(msg))
+                    ScreenReaderOutput.Say(msg);
+            }
+
+            // / key: Shift=unacted, Ctrl=acted, plain=ally distance
+            if (keySlash && !_lastKeySlash)
+            {
+                string msg;
+                if (shiftHeld)
+                    msg = _unitDistanceHandler.CycleUnacted(1, cursorCoord);
+                else if (ctrlHeld)
+                    msg = _unitDistanceHandler.CycleActed(1, cursorCoord);
+                else
+                    msg = _unitDistanceHandler.CycleAlly(1, cursorCoord);
+                if (!string.IsNullOrEmpty(msg))
+                    ScreenReaderOutput.Say(msg);
+            }
+
+            if (keyBackslash && !_lastKeyBackslash)
+            {
+                string msg = _unitDistanceHandler.RepeatLast(cursorCoord);
+                if (!string.IsNullOrEmpty(msg))
+                    ScreenReaderOutput.Say(msg);
+            }
+
+            _lastKeySemicolon = keySemicolon;
+            _lastKeyApostrophe = keyApostrophe;
+            _lastKeyPeriod = keyPeriod;
+            _lastKeySlash = keySlash;
+            _lastKeyBackslash = keyBackslash;
         }
     }
+
 }

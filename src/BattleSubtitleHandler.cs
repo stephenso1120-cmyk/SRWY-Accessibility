@@ -1,5 +1,7 @@
 using System;
+using System.Runtime.CompilerServices;
 using Il2CppCom.BBStudio.SRTeam.UIs;
+using Il2CppInterop.Runtime;
 using Il2CppTMPro;
 using UnityEngine;
 
@@ -10,17 +12,13 @@ namespace SRWYAccess
     /// During BATTLE_SCENE, voice lines play with text shown via dialogText
     /// (subtitle TMP) and pilotName (speaker TMP) fields on BattleSceneUI.
     ///
-    /// SAFETY: FindObjectOfType is called ONCE on initial entry (when scene is
-    /// stable after stabilization). The ref is then cached for all subsequent
-    /// reads. This avoids repeated FindObjectOfType calls from the background
-    /// thread - FindObjectOfType iterates Unity's internal object list, which
-    /// isn't thread-safe and crashes when the main thread is modifying it during
-    /// scene destruction (uncatchable AccessViolationException in .NET 6).
+    /// Runs on Unity main thread via native hook. FindObjectOfType is safe.
+    /// BattleSceneUI is found via FOT and cached; re-found if cache fails.
+    /// Stale detection reduces poll frequency when subtitles are idle.
     ///
-    /// Cached ref risk: Pointer stays non-zero after Unity destroys the native
-    /// object. Mitigated by aggressive stale detection (stops all IL2CPP access
-    /// within 600ms of last subtitle change) and permanent stop after timeout.
-    /// Each field access has only ~1μs TOCTOU window vs ~100μs for FindObjectOfType.
+    /// All IL2CPP field reads use SafeCall.ReadBattleTmpFieldText() or
+    /// SafeCall.ReadFieldPtrSafe() with VEH protection to prevent
+    /// uncatchable AccessViolationException when native objects are freed.
     ///
     /// All IL2CPP object null checks use (object)x != null to bypass
     /// Unity's overloaded == operator.
@@ -28,16 +26,17 @@ namespace SRWYAccess
     public class BattleSubtitleHandler
     {
         private BattleSceneUI _cachedSceneUI;
+        private NormalBattleUIHandler _cachedNormalUI;
+        private bool _usingNormalUI;
         private string _lastDialogText = "";
         private string _lastPilotName = "";
 
         // Public access for screen review
         public string LastDialogText => _lastDialogText;
         public string LastPilotName => _lastPilotName;
-        private int _namesRetries;       // retry count for unit name reads (GetComponentsInChildren is dangerous)
+        private int _namesRetries;       // retry count for unit name reads
         private int _staleDialogCount;   // consecutive polls with unchanged/empty dialog text
-        private int _readStatsCount;     // number of full stats reads this battle
-        private bool _initialFind;       // true after first successful find
+        private int _initSkipCount;      // skip first N updates after finding BattleSceneUI
 
         // Cached battle stats (managed strings, safe to read from any thread)
         public string LeftHp { get; private set; } = "";
@@ -55,6 +54,8 @@ namespace SRWYAccess
         public void ReleaseHandler()
         {
             _cachedSceneUI = null;
+            _cachedNormalUI = null;
+            _usingNormalUI = false;
             _lastDialogText = "";
             _lastPilotName = "";
             _namesRetries = 0;
@@ -65,123 +66,176 @@ namespace SRWYAccess
             LeftBullet = RightBullet = "";
             DamageCritical = "";
             _staleDialogCount = 0;
-            _readStatsCount = 0;
-            _initialFind = false;
+            _initSkipCount = 0;
         }
 
         /// <summary>
         /// Poll for battle subtitles.
         /// Called at reduced rate (~300ms) during BATTLE_SCENE.
-        /// Uses FindObjectOfType ONCE on initial entry, then cached ref for reads.
-        /// FindObjectOfType iterates Unity's internal object list and isn't
-        /// thread-safe from the background thread - crashes during scene
-        /// destruction when the main thread is modifying the list.
-        /// Cached ref has ~1μs TOCTOU per field access vs ~100μs for FOT iteration.
-        /// readStats: if true, also refresh HP/EN/state data.
+        /// readStats: if true, also refresh HP/EN/state data for screen review.
+        /// battlePoll: current battle poll counter for danger zone detection.
         /// </summary>
-        public void Update(bool readStats)
+        public void Update(bool readStats, int battlePoll)
         {
-            try
-            {
-                UpdateInner(readStats);
-            }
-            catch (Exception ex)
-            {
-                DebugHelper.Write($"BattleSubtitle: error: {ex.GetType().Name}: {ex.Message}");
-                _staleDialogCount = ModConfig.BattleStalePermanentStop;
-            }
-        }
+            // DANGER ZONE: polls 10-20 have heavy game engine initialization.
+            // Skip stat reading (9+ VEH calls) but allow subtitle reading (3 VEH calls).
+            // Original crashes (#12,15,17,19) were before VEH protection existed.
+            // With VEH, subtitle reading is safe - AV caught and returns null.
+            if (battlePoll >= 10 && battlePoll <= 20)
+                readStats = false;
 
-        private void UpdateInner(bool readStats)
-        {
-            // Stale dialog detection: if subtitle hasn't changed, reduce poll
-            // frequency to minimize IL2CPP accesses during battle ending.
+            // Stale dialog detection: reduce poll frequency when idle
             bool isStaleProbe = false;
             if (_staleDialogCount >= ModConfig.BattleStaleLimit)
             {
-                if (_staleDialogCount >= ModConfig.BattleStalePermanentStop) return;
                 _staleDialogCount++;
                 if (_staleDialogCount % ModConfig.BattleStaleProbeInterval != 0) return;
-                readStats = false; // No stats during stale probes
                 isStaleProbe = true;
             }
 
-            // First call: FindObjectOfType to find and cache BattleSceneUI.
-            // Only called ONCE per battle, right after scene stabilization
-            // (safe because no objects are being destroyed at this point).
-            // All subsequent reads use the cached ref to avoid FOT's
-            // thread-safety issues during active battle and scene destruction.
-            if (!_initialFind)
+            // NormalBattleUIHandler path: fully isolated in separate method
+            // to prevent JIT from resolving NormalBattleUIHandler type when
+            // this method is first compiled (could cause AV on some IL2CPP configs).
+            if (_usingNormalUI)
             {
-                BattleSceneUI found;
-                try
-                {
-                    found = UnityEngine.Object.FindObjectOfType<BattleSceneUI>();
-                }
-                catch
-                {
-                    _staleDialogCount = ModConfig.BattleStalePermanentStop;
-                    return;
-                }
-
-                if ((object)found == null) return;
-
-                _cachedSceneUI = found;
-                _initialFind = true;
-                DebugHelper.Write("BattleSubtitle: Found BattleSceneUI");
-                ReadBattleStats(_cachedSceneUI);
-            }
-
-            // Safety: managed null check (no IL2CPP access)
-            if (_cachedSceneUI == null)
-            {
-                _staleDialogCount = ModConfig.BattleStalePermanentStop;
+                UpdateNormalBattlePath(readStats, isStaleProbe);
                 return;
             }
 
-            // Read dialogText from cached ref.
-            // TOCTOU risk: ~1μs per field access. If Unity destroyed the native
-            // object between polls, Pointer stays non-zero but the field access
-            // hits freed memory → AV. Mitigated by aggressive stale detection
-            // (stops all access within 600ms of last subtitle change).
+            // Find BattleSceneUI (cached, re-found on failure)
+            if ((object)_cachedSceneUI == null)
+            {
+                _cachedSceneUI = UnityEngine.Object.FindObjectOfType<BattleSceneUI>();
+                if ((object)_cachedSceneUI != null)
+                {
+                    DebugHelper.Write("BattleSubtitle: Found BattleSceneUI");
+                    DebugHelper.Flush();
+                    _initSkipCount = 0; // VEH protection handles stale fields safely
+                    return; // Skip this cycle
+                }
+
+                // BattleSceneUI not found, try NormalBattleUIHandler (separate method)
+                if (TryFindNormalBattleUI())
+                    return; // Skip first cycle
+                return; // Neither found
+            }
+
+            // Skip first few updates after finding BattleSceneUI to allow full initialization
+            if (_initSkipCount > 0)
+            {
+                _initSkipCount--;
+                return;
+            }
+
+            // Validate Pointer before IL2CPP access (catch destroyed objects)
+            if (_cachedSceneUI.Pointer == IntPtr.Zero
+                || !SafeCall.ProbeObject(_cachedSceneUI.Pointer))
+            {
+                _cachedSceneUI = null;
+                return;
+            }
+
+            IntPtr sceneUIPtr = _cachedSceneUI.Pointer;
+
+            // Read subtitle text using VEH-protected field reads.
             string dialogText = null;
             string pilotName = null;
 
-            try
+            // CRITICAL: Only use SafeCall protected path. Fallback path with try-catch
+            // cannot catch AccessViolationException and will crash the game.
+            if (SafeCall.BattleFieldsAvailable)
             {
-                var dialogTmp = _cachedSceneUI.dialogText;
-                if ((object)dialogTmp != null)
-                    dialogText = dialogTmp.text;
+                dialogText = SafeCall.ReadBattleTmpFieldText(sceneUIPtr, SafeCall.OffsetDialogText);
+                pilotName = SafeCall.ReadBattleTmpFieldText(sceneUIPtr, SafeCall.OffsetPilotName);
             }
-            catch
+            else
             {
-                _staleDialogCount = ModConfig.BattleStalePermanentStop;
+                // SafeCall not available - skip reading to avoid AV crash
                 return;
             }
 
-            // During stale probes: only read dialogText (1 IL2CPP access).
-            // Skip pilotName and stats to minimize exposure.
-            if (!isStaleProbe)
-            {
-                try
-                {
-                    var pilotTmp = _cachedSceneUI.pilotName;
-                    if ((object)pilotTmp != null)
-                        pilotName = pilotTmp.text;
-                }
-                catch
-                {
-                    _staleDialogCount = ModConfig.BattleStalePermanentStop;
-                    return;
-                }
+            if (!isStaleProbe && readStats)
+                ReadBattleStats(sceneUIPtr);
 
-                if (readStats && _readStatsCount < ModConfig.BattleMaxStatsReads)
+            ProcessDialogText(dialogText, pilotName);
+        }
+
+        /// <summary>
+        /// Try finding NormalBattleUIHandler as fallback. Isolated into separate
+        /// method so JIT only resolves NormalBattleUIHandler type when called.
+        /// </summary>
+        [MethodImpl(MethodImplOptions.NoInlining)]
+        private bool TryFindNormalBattleUI()
+        {
+            try
+            {
+                _cachedNormalUI = UnityEngine.Object.FindObjectOfType<NormalBattleUIHandler>();
+                if ((object)_cachedNormalUI != null)
                 {
-                    _readStatsCount++;
-                    ReadBattleStats(_cachedSceneUI);
+                    _usingNormalUI = true;
+                    DebugHelper.Write("BattleSubtitle: Found NormalBattleUIHandler (fallback)");
+                    DebugHelper.Flush();
+                    _initSkipCount = 0; // VEH protection handles stale fields safely
+                    return true; // Skip this cycle
                 }
             }
+            catch (Exception ex)
+            {
+                DebugHelper.Write($"BattleSubtitle: NormalBattleUI find error: {ex.GetType().Name}");
+            }
+            return false;
+        }
 
+        /// <summary>
+        /// Full update path for NormalBattleUIHandler. Isolated into separate
+        /// method so JIT only resolves NormalBattleUIHandler type when called.
+        /// </summary>
+        [MethodImpl(MethodImplOptions.NoInlining)]
+        private void UpdateNormalBattlePath(bool readStats, bool isStaleProbe)
+        {
+            // Skip first few updates after finding NormalBattleUIHandler
+            if (_initSkipCount > 0)
+            {
+                _initSkipCount--;
+                return;
+            }
+
+            if ((object)_cachedNormalUI == null || _cachedNormalUI.Pointer == IntPtr.Zero
+                || !SafeCall.ProbeObject(_cachedNormalUI.Pointer))
+            {
+                _cachedNormalUI = null;
+                _usingNormalUI = false;
+                return;
+            }
+
+            IntPtr normalUIPtr = _cachedNormalUI.Pointer;
+            string dialogText = null;
+            string pilotName = null;
+
+            // CRITICAL: Only use SafeCall protected path.
+            if (SafeCall.NormalBattleFieldsAvailable)
+            {
+                dialogText = SafeCall.ReadBattleTmpFieldText(normalUIPtr, SafeCall.OffsetNormalDialogText);
+                pilotName = SafeCall.ReadBattleTmpFieldText(normalUIPtr, SafeCall.OffsetNormalPilotName);
+            }
+            else
+            {
+                // SafeCall not available - skip reading to avoid AV crash
+                return;
+            }
+
+            if (!isStaleProbe && readStats)
+                ReadNormalBattleStats(normalUIPtr);
+
+            ProcessDialogText(dialogText, pilotName);
+        }
+
+        /// <summary>
+        /// Process dialog text change detection and announcement.
+        /// Shared between BattleSceneUI and NormalBattleUIHandler paths.
+        /// </summary>
+        private void ProcessDialogText(string dialogText, string pilotName)
+        {
             dialogText = TextUtils.CleanRichText(dialogText);
             pilotName = TextUtils.CleanRichText(pilotName);
 
@@ -198,8 +252,9 @@ namespace SRWYAccess
                 else
                     announcement = dialogText;
 
-                ScreenReaderOutput.Say(announcement);
+                ScreenReaderOutput.SayQueued(announcement);
                 DebugHelper.Write($"BattleSubtitle: [{pilotName}] {dialogText}");
+                DebugHelper.Flush();
             }
             else
             {
@@ -213,102 +268,98 @@ namespace SRWYAccess
             }
         }
 
-        private void ReadBattleStats(BattleSceneUI sceneUI)
+        /// <summary>
+        /// Read battle stats from BattleSceneUI using VEH-protected field reads.
+        /// Stats are cached for screen review (R key) only.
+        /// </summary>
+        private void ReadBattleStats(IntPtr sceneUIPtr)
         {
-            // Read each stat independently. Individual field failures should NOT
-            // invalidate the entire BattleSceneUI cache - a momentarily null TMP
-            // field is not a sign that the sceneUI object is destroyed.
-            try
-            {
-                var tmp = sceneUI.leftHpText;
-                if ((object)tmp != null) LeftHp = tmp.text ?? "";
-            }
-            catch { }
-            try
-            {
-                var tmp = sceneUI.rightHpText;
-                if ((object)tmp != null) RightHp = tmp.text ?? "";
-            }
-            catch { }
-            try
-            {
-                var tmp = sceneUI.leftEnText;
-                if ((object)tmp != null) LeftEn = tmp.text ?? "";
-            }
-            catch { }
-            try
-            {
-                var tmp = sceneUI.rightEnText;
-                if ((object)tmp != null) RightEn = tmp.text ?? "";
-            }
-            catch { }
+            if (!SafeCall.ProbeObject(sceneUIPtr)) return;
 
-            // Battle state text (e.g. "攻撃" / "反撃")
-            try
+            if (SafeCall.BattleFieldsAvailable)
             {
-                var tmp = sceneUI.leftBattleStateText;
-                if ((object)tmp != null) { string t = TextUtils.CleanRichText(tmp.text); if (!string.IsNullOrWhiteSpace(t)) LeftBattleState = t; }
-            }
-            catch { }
-            try
-            {
-                var tmp = sceneUI.rightBattleStateText;
-                if ((object)tmp != null) { string t = TextUtils.CleanRichText(tmp.text); if (!string.IsNullOrWhiteSpace(t)) RightBattleState = t; }
-            }
-            catch { }
+                // VEH-protected path: each read catches AV silently
+                string v;
 
-            // Bullet/ammo text
-            try
-            {
-                var tmp = sceneUI.leftEnBulletText;
-                if ((object)tmp != null) { string t = TextUtils.CleanRichText(tmp.text); if (!string.IsNullOrWhiteSpace(t)) LeftBullet = t; }
-            }
-            catch { }
-            try
-            {
-                var tmp = sceneUI.rightEnBulletText;
-                if ((object)tmp != null) { string t = TextUtils.CleanRichText(tmp.text); if (!string.IsNullOrWhiteSpace(t)) RightBullet = t; }
-            }
-            catch { }
+                v = SafeCall.ReadBattleTmpFieldText(sceneUIPtr, SafeCall.OffsetLeftHpText);
+                if (v != null) LeftHp = v;
 
-            // Damage/critical text
-            try
-            {
-                var tmp = sceneUI.damageCriticalText;
-                if ((object)tmp != null) { string t = TextUtils.CleanRichText(tmp.text); if (!string.IsNullOrWhiteSpace(t)) DamageCritical = t; }
-            }
-            catch { }
+                v = SafeCall.ReadBattleTmpFieldText(sceneUIPtr, SafeCall.OffsetRightHpText);
+                if (v != null) RightHp = v;
 
-            // Read unit names from info panel GameObjects (leftInfoGo/rightInfoGo).
-            // GetComponentsInChildren is a Unity native call that iterates the
-            // component hierarchy - extremely dangerous from a background thread
-            // if the object is being destroyed (uncatchable AV). Retry up to 3
-            // times (across readStats calls = ~9s window) to handle late UI loading.
-            bool needNames = string.IsNullOrWhiteSpace(LeftName) || string.IsNullOrWhiteSpace(RightName);
-            if (needNames && _namesRetries < ModConfig.BattleNamesMaxRetries)
-            {
-                _namesRetries++;
-                try
+                v = SafeCall.ReadBattleTmpFieldText(sceneUIPtr, SafeCall.OffsetLeftEnText);
+                if (v != null) LeftEn = v;
+
+                v = SafeCall.ReadBattleTmpFieldText(sceneUIPtr, SafeCall.OffsetRightEnText);
+                if (v != null) RightEn = v;
+
+                v = SafeCall.ReadBattleTmpFieldText(sceneUIPtr, SafeCall.OffsetLeftBattleStateText);
+                if (v != null) { string t = TextUtils.CleanRichText(v); if (!string.IsNullOrWhiteSpace(t)) LeftBattleState = t; }
+
+                v = SafeCall.ReadBattleTmpFieldText(sceneUIPtr, SafeCall.OffsetRightBattleStateText);
+                if (v != null) { string t = TextUtils.CleanRichText(v); if (!string.IsNullOrWhiteSpace(t)) RightBattleState = t; }
+
+                v = SafeCall.ReadBattleTmpFieldText(sceneUIPtr, SafeCall.OffsetLeftEnBulletText);
+                if (v != null) { string t = TextUtils.CleanRichText(v); if (!string.IsNullOrWhiteSpace(t)) LeftBullet = t; }
+
+                v = SafeCall.ReadBattleTmpFieldText(sceneUIPtr, SafeCall.OffsetRightEnBulletText);
+                if (v != null) { string t = TextUtils.CleanRichText(v); if (!string.IsNullOrWhiteSpace(t)) RightBullet = t; }
+
+                v = SafeCall.ReadBattleTmpFieldText(sceneUIPtr, SafeCall.OffsetDamageCriticalText);
+                if (v != null) { string t = TextUtils.CleanRichText(v); if (!string.IsNullOrWhiteSpace(t)) DamageCritical = t; }
+
+                // Unit names from info GameObjects
+                bool needNames = string.IsNullOrWhiteSpace(LeftName) || string.IsNullOrWhiteSpace(RightName);
+                if (needNames && _namesRetries < ModConfig.BattleNamesMaxRetries)
                 {
-                    var go = sceneUI.leftInfoGo;
-                    if ((object)go != null && go.Pointer != IntPtr.Zero)
+                    _namesRetries++;
+                    IntPtr leftGoPtr = SafeCall.ReadFieldPtrSafe(sceneUIPtr, SafeCall.OffsetLeftInfoGo);
+                    if (leftGoPtr != IntPtr.Zero && SafeCall.ProbeObject(leftGoPtr))
                     {
-                        string n = ReadBestNameText(go);
-                        if (!string.IsNullOrWhiteSpace(n)) LeftName = n;
+                        try
+                        {
+                            var go = new GameObject(leftGoPtr);
+                            string n = ReadBestNameText(go);
+                            if (!string.IsNullOrWhiteSpace(n)) LeftName = n;
+                        }
+                        catch { }
+                    }
+                    IntPtr rightGoPtr = SafeCall.ReadFieldPtrSafe(sceneUIPtr, SafeCall.OffsetRightInfoGo);
+                    if (rightGoPtr != IntPtr.Zero && SafeCall.ProbeObject(rightGoPtr))
+                    {
+                        try
+                        {
+                            var go = new GameObject(rightGoPtr);
+                            string n = ReadBestNameText(go);
+                            if (!string.IsNullOrWhiteSpace(n)) RightName = n;
+                        }
+                        catch { }
                     }
                 }
-                catch { }
-                try
-                {
-                    var go = sceneUI.rightInfoGo;
-                    if ((object)go != null && go.Pointer != IntPtr.Zero)
-                    {
-                        string n = ReadBestNameText(go);
-                        if (!string.IsNullOrWhiteSpace(n)) RightName = n;
-                    }
-                }
-                catch { }
             }
+            // CRITICAL: Fallback path removed - try-catch cannot catch AV
+        }
+
+        /// <summary>
+        /// Read battle stats from NormalBattleUIHandler using VEH-protected field reads.
+        /// </summary>
+        private void ReadNormalBattleStats(IntPtr normalUIPtr)
+        {
+            if (!SafeCall.ProbeObject(normalUIPtr)) return;
+
+            if (SafeCall.NormalBattleFieldsAvailable)
+            {
+                string v;
+                v = SafeCall.ReadBattleTmpFieldText(normalUIPtr, SafeCall.OffsetNormalLeftHPText);
+                if (v != null) LeftHp = v;
+                v = SafeCall.ReadBattleTmpFieldText(normalUIPtr, SafeCall.OffsetNormalRightHpText);
+                if (v != null) RightHp = v;
+                v = SafeCall.ReadBattleTmpFieldText(normalUIPtr, SafeCall.OffsetNormalLeftEnText);
+                if (v != null) LeftEn = v;
+                v = SafeCall.ReadBattleTmpFieldText(normalUIPtr, SafeCall.OffsetNormalRightEnText);
+                if (v != null) RightEn = v;
+            }
+            // CRITICAL: Fallback path removed - try-catch cannot catch AV
         }
 
         /// <summary>
@@ -363,32 +414,52 @@ namespace SRWYAccess
         /// leftInfoGo/rightInfoGo contain HP/EN number labels mixed with
         /// pilot/robot names. We skip purely numeric text (HP/EN values)
         /// and return the longest non-numeric text (the unit name).
+        /// CRITICAL: GetComponentsInChildren needs inner try-catch protection.
         /// </summary>
         private static string ReadBestNameText(GameObject go)
         {
+            // CRITICAL: Inner try-catch for GetComponentsInChildren
+            Il2CppInterop.Runtime.InteropTypes.Arrays.Il2CppArrayBase<TextMeshProUGUI> tmps = null;
             try
             {
-                var tmps = go.GetComponentsInChildren<TextMeshProUGUI>(false);
-                if (tmps == null || tmps.Count == 0) return null;
-
-                string bestText = null;
-                foreach (var tmp in tmps)
-                {
-                    if ((object)tmp == null) continue;
-                    try
-                    {
-                        string t = TextUtils.CleanRichText(tmp.text);
-                        if (string.IsNullOrWhiteSpace(t)) continue;
-                        if (IsNumericOrSlash(t)) continue;
-                        if (bestText == null || t.Length > bestText.Length)
-                            bestText = t;
-                    }
-                    catch { }
-                }
-                return bestText;
+                tmps = go.GetComponentsInChildren<TextMeshProUGUI>(false);
             }
-            catch { }
-            return null;
+            catch (Exception ex)
+            {
+                DebugHelper.Write($"BattleSubtitle: ReadBestNameText GetComponentsInChildren error: {ex.GetType().Name}");
+                return null;
+            }
+
+            if (tmps == null || tmps.Count == 0) return null;
+
+            string bestText = null;
+            foreach (var tmp in tmps)
+            {
+                if ((object)tmp == null) continue;
+
+                // CRITICAL: Use SafeCall to read tmp.text - direct access causes
+                // uncatchable AV when TMP object is destroyed during animation
+                string t = null;
+                if (SafeCall.TmpTextMethodAvailable)
+                {
+                    IntPtr il2cppStrPtr = SafeCall.ReadTmpTextSafe(tmp.Pointer);
+                    if (il2cppStrPtr != IntPtr.Zero)
+                    {
+                        try
+                        {
+                            t = IL2CPP.Il2CppStringToManaged(il2cppStrPtr);
+                            t = TextUtils.CleanRichText(t);
+                        }
+                        catch { }
+                    }
+                }
+
+                if (string.IsNullOrWhiteSpace(t)) continue;
+                if (IsNumericOrSlash(t)) continue;
+                if (bestText == null || t.Length > bestText.Length)
+                    bestText = t;
+            }
+            return bestText;
         }
 
         /// <summary>

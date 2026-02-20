@@ -4,6 +4,7 @@ using UnityEngine;
 using Il2CppCom.BBStudio.SRTeam.Inputs;
 using Il2CppCom.BBStudio.SRTeam.UIs;
 using Il2CppTMPro;
+using Il2CppInterop.Runtime;
 
 namespace SRWYAccess
 {
@@ -182,6 +183,10 @@ namespace SRWYAccess
                     if (GameStateTracker.IsTacticalMode(currentMode) || postTactical)
                         CollectTacticalOverlayItems(_items);
 
+                    // Intermission menu (MonoBehaviour, not UIHandlerBase)
+                    // Only visible during strategy/intermission. Safe: on key press only.
+                    CollectIntermissionItems(_items);
+
                     // Tutorial overlay
                     _tutorialHandler?.CollectReviewItems(_items);
 
@@ -233,6 +238,19 @@ namespace SRWYAccess
                     var go = sitInfo.gameObject;
                     if ((object)go != null && go.activeInHierarchy)
                         CollectSituationItems(items, sitInfo);
+                }
+            }
+            catch { }
+
+            // Phase info (wave number, enemy count)
+            try
+            {
+                var phaseInfo = UnityEngine.Object.FindObjectOfType<TacticalPartPhaseInfo>();
+                if ((object)phaseInfo != null && phaseInfo.Pointer != IntPtr.Zero)
+                {
+                    var go = phaseInfo.gameObject;
+                    if ((object)go != null && go.activeInHierarchy)
+                        CollectPhaseInfoItems(items, phaseInfo);
                 }
             }
             catch { }
@@ -367,17 +385,133 @@ namespace SRWYAccess
         }
 
         /// <summary>
+        /// Read phase info: wave number and remaining enemy count.
+        /// TacticalPartPhaseInfo is a MonoBehaviour shown during tactical battles.
+        /// </summary>
+        private static void CollectPhaseInfoItems(List<string> items, TacticalPartPhaseInfo phaseInfo)
+        {
+            try
+            {
+                // Wave number
+                string wave = ReadTmpSafe(phaseInfo.waveNum);
+                string maxWave = ReadTmpSafe(phaseInfo.maxWaveNum);
+                if (!string.IsNullOrWhiteSpace(wave) || !string.IsNullOrWhiteSpace(maxWave))
+                    items.Add(Loc.Get("phase_wave", wave ?? "?", maxWave ?? "?"));
+
+                // Remaining enemies
+                string enemies = ReadTmpSafe(phaseInfo.numOfEnemyText);
+                if (!string.IsNullOrWhiteSpace(enemies))
+                    items.Add(Loc.Get("phase_enemies", enemies));
+            }
+            catch { }
+        }
+
+        // ===== Intermission MonoBehaviour =====
+
+        /// <summary>
+        /// Find and read IntermissionUIHandler if active.
+        /// This is a MonoBehaviour (not UIHandlerBase) with commandList and selectedCommandIdx.
+        /// Only called on R key press for screen review, not during polling.
+        /// </summary>
+        private void CollectIntermissionItems(List<string> items)
+        {
+            try
+            {
+                var intermission = UnityEngine.Object.FindObjectOfType<IntermissionUIHandler>();
+                if ((object)intermission == null || intermission.Pointer == IntPtr.Zero) return;
+
+                var go = intermission.gameObject;
+                if ((object)go == null || !go.activeInHierarchy) return;
+
+                items.Add(Loc.Get("screen_intermissionuihandler"));
+
+                var cmdList = intermission.commandList;
+                if ((object)cmdList == null) return;
+
+                int selectedIdx = -1;
+                try { selectedIdx = intermission.selectedCommandIdx; } catch { }
+
+                for (int i = 0; i < cmdList.Count; i++)
+                {
+                    try
+                    {
+                        var cmdGo = cmdList[i];
+                        if ((object)cmdGo == null || !cmdGo.activeInHierarchy) continue;
+
+                        // Read TMP text from command GameObject children
+                        Il2CppInterop.Runtime.InteropTypes.Arrays.Il2CppArrayBase<TextMeshProUGUI> tmps = null;
+                        try
+                        {
+                            tmps = cmdGo.GetComponentsInChildren<TextMeshProUGUI>(false);
+                        }
+                        catch (Exception ex)
+                        {
+                            DebugHelper.Write($"ScreenReview: IntermissionUIHandler GetComponentsInChildren error: {ex.GetType().Name}");
+                            continue;
+                        }
+                        if (tmps == null || tmps.Count == 0) continue;
+
+                        string bestText = null;
+                        foreach (var tmp in tmps)
+                        {
+                            if ((object)tmp == null) continue;
+
+                            // CRITICAL: Use SafeCall to read tmp.text
+                            string t = null;
+                            if (SafeCall.TmpTextMethodAvailable)
+                            {
+                                IntPtr il2cppStrPtr = SafeCall.ReadTmpTextSafe(tmp.Pointer);
+                                if (il2cppStrPtr != IntPtr.Zero)
+                                {
+                                    try
+                                    {
+                                        t = IL2CPP.Il2CppStringToManaged(il2cppStrPtr);
+                                        t = TextUtils.CleanRichText(t);
+                                    }
+                                    catch { }
+                                }
+                            }
+
+                            if (!string.IsNullOrWhiteSpace(t) && (bestText == null || t.Length > bestText.Length))
+                                bestText = t;
+                        }
+
+                        if (!string.IsNullOrWhiteSpace(bestText))
+                        {
+                            string prefix = (i == selectedIdx) ? "(*) " : "";
+                            items.Add(prefix + bestText);
+                        }
+                    }
+                    catch { }
+                }
+            }
+            catch { }
+        }
+
+        /// <summary>
         /// Safely read text from a TextMeshProUGUI, returning null on any error.
         /// </summary>
         private static string ReadTmpSafe(TextMeshProUGUI tmp)
         {
             if ((object)tmp == null) return null;
-            try
+
+            // CRITICAL: Use SafeCall to read tmp.text - direct access causes
+            // uncatchable AV when TMP object is destroyed during scene transitions
+            if (SafeCall.TmpTextMethodAvailable)
             {
-                string t = TextUtils.CleanRichText(tmp.text);
-                return string.IsNullOrWhiteSpace(t) ? null : t;
+                IntPtr il2cppStrPtr = SafeCall.ReadTmpTextSafe(tmp.Pointer);
+                if (il2cppStrPtr != IntPtr.Zero)
+                {
+                    try
+                    {
+                        string t = IL2CPP.Il2CppStringToManaged(il2cppStrPtr);
+                        t = TextUtils.CleanRichText(t);
+                        return string.IsNullOrWhiteSpace(t) ? null : t;
+                    }
+                    catch { }
+                }
             }
-            catch { return null; }
+            return null;
         }
     }
 }
