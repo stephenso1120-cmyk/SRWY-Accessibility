@@ -800,5 +800,74 @@ namespace SRWYAccess
                 return pilotName + " / " + robotName;
             return robotName ?? pilotName;
         }
+        /// <summary>
+        /// Get detailed path from cursor to the last announced target unit.
+        /// Returns string like "東3北4" or null if no valid target.
+        /// Grid: +X = East, +Y = South.
+        /// </summary>
+        public string GetPathToLastTarget(Vector2Int cursorCoord)
+        {
+            IntPtr targetPtr = GetLastTargetPtr();
+            if (targetPtr == IntPtr.Zero || !SafeCall.ProbeObject(targetPtr))
+                return null;
+
+            var (ok, tx, ty) = SafeCall.ReadCurrentCoordSafe(targetPtr);
+            if (!ok) return null;
+
+            int dx = tx - cursorCoord.x;
+            int dy = ty - cursorCoord.y;
+
+            if (dx == 0 && dy == 0)
+                return Loc.Get("path_same_position");
+
+            return BuildDetailedPath(dx, dy);
+        }
+
+        /// <summary>
+        /// Get the pointer of the last announced target unit.
+        /// </summary>
+        private IntPtr GetLastTargetPtr()
+        {
+            switch (_lastList)
+            {
+                case LastListType.Enemy:
+                    return _lastEnemyPtr;
+                case LastListType.Ally:
+                    return _lastAllyPtr;
+                case LastListType.Unacted:
+                    return _lastUnactedPtr;
+                case LastListType.Acted:
+                    return _lastActedPtr;
+                default:
+                    return IntPtr.Zero;
+            }
+        }
+
+        /// <summary>
+        /// Build detailed path: "東3北4" style.
+        /// +X = East, +Y = South.
+        /// </summary>
+        private static string BuildDetailedPath(int dx, int dy)
+        {
+            string xPart = null;
+            string yPart = null;
+
+            // Use short direction names (東/西/南/北) for compact path format
+            if (dx > 0)
+                xPart = Loc.Get("dir_east") + dx;
+            else if (dx < 0)
+                xPart = Loc.Get("dir_west") + Math.Abs(dx);
+
+            if (dy > 0)
+                yPart = Loc.Get("dir_south") + dy;
+            else if (dy < 0)
+                yPart = Loc.Get("dir_north") + Math.Abs(dy);
+
+            if (xPart != null && yPart != null)
+                return xPart + yPart;
+            if (xPart != null) return xPart;
+            if (yPart != null) return yPart;
+            return Loc.Get("path_same_position");
+        }
     }
 }

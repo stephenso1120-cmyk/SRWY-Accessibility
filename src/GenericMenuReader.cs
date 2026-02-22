@@ -84,7 +84,9 @@ namespace SRWYAccess
             "DialogSystem",
             "SimpleBattleHandler", // transient battle animation handler, freed during transitions → AV crash
             "SingleSimpleBattleHandler", // same as SimpleBattleHandler: transient, freed mid-transition → AV crash
-            "SubtitleUIHandler" // handled by AdventureDialogueHandler, freed during ADVENTURE->NONE transitions → AV crash
+            "SubtitleUIHandler", // handled by AdventureDialogueHandler, freed during ADVENTURE->NONE transitions → AV crash
+            "OptionUIHandler",  // handled by SystemOptionHandler (column-based cursor + value tracking)
+            "OptionUIHandlerV"  // variant of OptionUIHandler
         };
 
         // Info screen types: read all visible TMP text as fallback
@@ -103,8 +105,7 @@ namespace SRWYAccess
             "PrologueSystem",              // prologue narrative text
             "FullCustomBonusUIHandler",    // custom bonus choice/description panel
             "CustomBonusEffectUIHandler",  // custom bonus effect display
-            "OptionUIHandler",             // system options panel
-            "OptionUIHandlerV",            // system options variant
+            // OptionUIHandler/OptionUIHandlerV: now handled by SystemOptionHandler
             "LibraryPlayerRecordUIHandler", // player records display
             "LicenceWindowUIHandler",      // license/legal text scroll
             "DesignWorkUIHandler",         // design work viewer
@@ -144,6 +145,8 @@ namespace SRWYAccess
         // BattleCheckMenuHandler cursor tracking: doesn't update currentCursorIndex.
         // Track curBattleCheckMenuButtonType changes instead.
         private int _lastBattleCheckBtnType = -1;
+        // BattleCheckMenuHandler demoText: shows battle animation on/off status.
+        private string _lastDemoText = null;
 
         // AssistLinkManager cursor tracking: uses CursorInfo.SelectNo instead of
         // currentCursorIndex. Track selection changes for grid-based navigation.
@@ -156,7 +159,8 @@ namespace SRWYAccess
         private string _cachedALCommandName;
         private string _cachedALCmdStr;     // populated from TMP in deferred read
         private string _cachedALPassiveStr; // populated from TMP in deferred read
-        private int _cachedALLevel = -1;    // from workCopy
+        private string _cachedALLevelText;  // from TMP select_chara_level_text
+        private int _cachedALLevel = -1;    // from workCopy (fallback if TMP empty)
         private bool _cachedALRegistered;   // from workCopy
 
         // Track extra command buttons that cursor doesn't navigate to
@@ -173,6 +177,13 @@ namespace SRWYAccess
         private int _lastTrainingMenuType = -2; // -2 = unset (MenuType.Default = -1)
         private int _lastTrainingSelectType = -1;
         private int _lastTrainingCursorIndex = -1;
+        private IntPtr _lastTrainingPilotPtr = IntPtr.Zero; // Q/E pilot switch detection
+
+        // PartsEquip slot tracking: track slot index and select type separately
+        // from the parts list cursor (currentIndex / _lastCursorIndex).
+        private int _lastPartsSlotIndex = -1;
+        private int _lastPartsSelectType = -1; // 0=Equiped, 1=Select
+        private IntPtr _lastPartsRobotPtr = IntPtr.Zero; // Q/E robot switch detection
 
         // StatusUIHandler tab tracking: PILOT=0, ROBOT=1, WEAPON=2
         private int _lastStatusUIType = -2; // -2 = unset
@@ -228,6 +239,7 @@ namespace SRWYAccess
             _lastSpiritPilotIndex = -1;
             _lastOthersCmdBtnPtr = IntPtr.Zero;
             _lastBattleCheckBtnType = -1;
+            _lastDemoText = null;
             _lastAssistSelectNo = -1;
             _stalePollCount = 0;
             _cachedALId = null;
@@ -235,11 +247,16 @@ namespace SRWYAccess
             _cachedALCommandName = null;
             _cachedALCmdStr = null;
             _cachedALPassiveStr = null;
+            _cachedALLevelText = null;
             _cachedALLevel = -1;
             _cachedALRegistered = false;
             _lastTrainingMenuType = -2;
             _lastTrainingSelectType = -1;
             _lastTrainingCursorIndex = -1;
+            _lastTrainingPilotPtr = IntPtr.Zero;
+            _lastPartsSlotIndex = -1;
+            _lastPartsSelectType = -1;
+            _lastPartsRobotPtr = IntPtr.Zero;
             _lastStatusUIType = -2;
             _lastCharSelectCharacter = -1;
             _lastCharSelectState = -1;
@@ -264,6 +281,7 @@ namespace SRWYAccess
             _lastCursorIndex = -1;
             _stalePollCount = 0;
             _lastBattleCheckBtnType = -1;
+            _lastDemoText = null;
             _lastSpiritBtnPtr = IntPtr.Zero;
             _lastOthersCmdBtnPtr = IntPtr.Zero;
             _lastAssistSelectNo = -1;
@@ -272,6 +290,9 @@ namespace SRWYAccess
             _lastTrainingMenuType = -2;
             _lastTrainingSelectType = -1;
             _lastTrainingCursorIndex = -1;
+            _lastPartsSlotIndex = -1;
+            _lastPartsSelectType = -1;
+            // Keep _lastPartsRobotPtr: don't reset so Q/E robot switch is detected
             _lastStatusUIType = -2;
             _lastCharSelectCharacter = -1;
             _lastCharSelectState = -1;
@@ -614,6 +635,32 @@ namespace SRWYAccess
                     btnType = (int)handler.curBattleCheckMenuButtonType;
                 }
 
+                // Check demoText (battle animation on/off) every poll
+                try
+                {
+                    var demoTmp = handler.demoText;
+                    if ((object)demoTmp != null && demoTmp.Pointer != IntPtr.Zero)
+                    {
+                        var demoStrPtr = SafeCall.ReadTmpTextSafe(demoTmp.Pointer);
+                        string demoVal = (demoStrPtr != IntPtr.Zero) ? SafeCall.SafeIl2CppStringToManaged(demoStrPtr) : null;
+                        if (!string.IsNullOrEmpty(demoVal) && demoVal != _lastDemoText)
+                        {
+                            bool isFirstDemo = _lastDemoText == null;
+                            _lastDemoText = demoVal;
+                            if (!isFirstDemo)
+                            {
+                                // Announce battle animation toggle change
+                                string announcement = Loc.Get("battle_anim_label") + demoVal;
+                                ScreenReaderOutput.Say(announcement);
+                                DebugHelper.Write($"GenericMenu: demoText changed to '{demoVal}'");
+                            }
+                            else
+                                DebugHelper.Write($"GenericMenu: demoText initial='{demoVal}'");
+                        }
+                    }
+                }
+                catch { }
+
                 if (btnType == _lastBattleCheckBtnType)
                     return false; // no change
 
@@ -836,28 +883,37 @@ namespace SRWYAccess
                 var alm = GetActiveAssistLinkManager();
                 if ((object)alm == null || alm.Pointer == IntPtr.Zero) return null;
 
-                string cmdName = null, personName = null;
+                string cmdName = null, personName = null, levelText = null;
                 try { var t = alm.command_name_text; if ((object)t != null) cmdName = ReadTmpSafe(t); } catch { }
                 try { var t = alm.select_chara_name_text; if ((object)t != null) personName = ReadTmpSafe(t); } catch { }
+                try { var t = alm.select_chara_level_text; if ((object)t != null) levelText = ReadTmpSafe(t); } catch { }
+                // Also try select_chara_level_text_in (alternative TMP for level)
+                string levelTextIn = null;
+                if (string.IsNullOrWhiteSpace(levelText))
+                {
+                    try { var t = alm.select_chara_level_text_in; if ((object)t != null) { levelTextIn = ReadTmpSafe(t); if (!string.IsNullOrWhiteSpace(levelTextIn)) levelText = levelTextIn; } } catch { }
+                }
 
-                DebugHelper.Write($"GenericMenu: [AssistLink TMP] cmd=[{cmdName}] name=[{personName}]");
+                DebugHelper.Write($"GenericMenu: [AssistLink TMP] cmd=[{cmdName}] name=[{personName}] lv=[{levelText}] lvIn=[{levelTextIn}]");
 
                 var sb = new System.Text.StringBuilder();
                 if (!string.IsNullOrWhiteSpace(cmdName))
-                {
                     sb.Append(TextUtils.CleanRichText(cmdName));
-                    sb.Append(" - ");
-                }
                 if (!string.IsNullOrWhiteSpace(personName))
+                {
+                    if (sb.Length > 0) sb.Append(" - ");
                     sb.Append(TextUtils.CleanRichText(personName));
+                }
 
                 if (sb.Length == 0) return null; // TMP not ready yet, retry
 
-                // Append level and registered status
+                // Append level (0-based enum: Lv1=0, Lv2=1, ...; display = level+1)
+                // Always use Loc.Get format (TMP lv is bare number without prefix)
                 if (_cachedALLevel >= 0)
                 {
+                    _cachedALLevelText = Loc.Get("assistlink_level", _cachedALLevel + 1);
                     sb.Append(" ");
-                    sb.Append(Loc.Get("assistlink_level", _cachedALLevel + 1));
+                    sb.Append(_cachedALLevelText);
                 }
                 if (_cachedALRegistered)
                 {
@@ -1189,9 +1245,52 @@ namespace SRWYAccess
                 _lastAssistSelectNo = selectNo;
                 _lastCursorIndex = selectNo;
 
-                // Update _cachedALId to prevent false itemChanged on subsequent frames.
-                // (workCopy id may not match the visual item, but we only need it
-                // for change detection, not for data lookup.)
+                // Try to get correct level via itemList (visual buttons).
+                // workCopy order may NOT match visual display order.
+                // itemList is a recycled pool; match by ButtonItem.no == selectNo.
+                int correctLevel = -1;
+                bool correctRegistered = false;
+                string correctId = null;
+                try
+                {
+                    var items = alm.itemList;
+                    if ((object)items != null)
+                    {
+                        for (int i = 0; i < items.Count; i++)
+                        {
+                            var btn = items[i];
+                            if ((object)btn != null && btn.no == selectNo)
+                            {
+                                correctId = btn.id;
+                                break;
+                            }
+                        }
+                    }
+                    if (!string.IsNullOrEmpty(correctId))
+                    {
+                        correctLevel = alm.GetLevel(correctId);
+                        // Check equipped status via wk.selected (regist/isRegistered are always true)
+                        var wkList = alm.assist_link_work_copy;
+                        if ((object)wkList != null)
+                        {
+                            for (int i = 0; i < wkList.Count; i++)
+                            {
+                                var w = wkList[i];
+                                if ((object)w != null && w.id == correctId)
+                                {
+                                    correctRegistered = w.selected;
+                                    break;
+                                }
+                            }
+                        }
+                    }
+                }
+                catch (Exception ex)
+                {
+                    DebugHelper.Write($"GenericMenu: [AL] itemList lookup error: {ex.Message}");
+                }
+
+                // Fallback: workCopy[selectNo] (may be wrong order during battle)
                 try
                 {
                     var workCopy = alm.assist_link_work_copy;
@@ -1201,16 +1300,23 @@ namespace SRWYAccess
                         if ((object)wk != null)
                         {
                             _cachedALId = wk.id;
-                            _cachedALLevel = wk.level;
-                            _cachedALRegistered = wk.regist;
+                            if (correctLevel >= 0)
+                            {
+                                _cachedALLevel = correctLevel;
+                                _cachedALRegistered = correctRegistered;
+                                DebugHelper.Write($"GenericMenu: [AL] id={correctId} lv={correctLevel} sel={correctRegistered}");
+                            }
+                            else
+                            {
+                                _cachedALLevel = wk.level;
+                                _cachedALRegistered = wk.selected;
+                                DebugHelper.Write($"GenericMenu: [AL] workCopy fallback: wk[{selectNo}].id={wk.id} lv={wk.level} sel={wk.selected}");
+                            }
                         }
                     }
                 }
                 catch { }
 
-                // During battle, assist_link_work_copy order does NOT match the
-                // visual display. GetAssistLinkData(workCopy[n].id) returns the
-                // WRONG item's names. TMP fields are the only reliable source.
                 // Defer ALL reading by 2 frames so the game updates TMP first.
                 _cachedALCommandName = null;
                 _cachedALPersonName = null;
@@ -1433,9 +1539,9 @@ namespace SRWYAccess
 
         /// <summary>
         /// Special update path for PartsEquipUIHandler.
-        /// This handler doesn't update currentCursorIndex from UIHandlerBase.
-        /// Track equipmentUIHandler.currentIndex instead, and read part name
-        /// from the list item's m_PartsName TMP field + remain/total counts.
+        /// Dual-mode handling:
+        ///   SelectType.Equiped (0): slot view — track selectSlotIndex, read slot name + description
+        ///   SelectType.Select (1): parts list — track currentIndex, read part name + count
         /// </summary>
         private bool UpdatePartsEquipHandler()
         {
@@ -1458,32 +1564,107 @@ namespace SRWYAccess
                 var equipUI = peHandler.equipmentUIHandler;
                 if ((object)equipUI == null || equipUI.Pointer == IntPtr.Zero) return false;
 
-                int curIdx = equipUI.currentIndex;
-                if (curIdx == _lastCursorIndex)
-                    return false;
-
-                _lastCursorIndex = curIdx;
-                _stalePollCount = 0;
-
-                // Read part name from the list item via ListHandlerBase
-                string text = null;
-                if ((object)_listHandler != null)
-                    text = ReadPartsListItemText(curIdx);
-
-                // Fallback: generic list reading
-                if (string.IsNullOrWhiteSpace(text))
-                    text = ReadListItemText(curIdx);
-
-                if (!string.IsNullOrWhiteSpace(text))
+                // Q/E robot switch detection: track currentRobot pointer
+                IntPtr robotPtr = IntPtr.Zero;
+                try
                 {
-                    ScreenReaderOutput.Say(text);
-                    _descriptionDelay = 3;
-                    _descriptionRetries = 0;
-                    DebugHelper.Write($"GenericMenu: [PartsEquip] cursor={curIdx} text={text}");
+                    var robot = equipUI.currentRobot;
+                    if ((object)robot != null)
+                        robotPtr = robot.Pointer;
                 }
-                else
+                catch { }
+
+                if (robotPtr != _lastPartsRobotPtr && _lastPartsRobotPtr != IntPtr.Zero)
                 {
-                    DebugHelper.Write($"GenericMenu: [PartsEquip] cursor={curIdx} no text found");
+                    // Robot changed → announce new robot name, reset slot tracking
+                    _lastPartsSlotIndex = -1;
+                    _lastCursorIndex = -1;
+                    _stalePollCount = 0;
+
+                    string robotName = null;
+                    try
+                    {
+                        var unitBase = equipUI.unitBaseData;
+                        if ((object)unitBase != null && unitBase.Pointer != IntPtr.Zero
+                            && SafeCall.ProbeObject(unitBase.Pointer))
+                        {
+                            var nameTmp = unitBase.m_RobotNameText;
+                            if ((object)nameTmp != null)
+                                robotName = ReadTmpSafe(nameTmp);
+                        }
+                    }
+                    catch { }
+
+                    if (!string.IsNullOrWhiteSpace(robotName))
+                    {
+                        ScreenReaderOutput.Say(robotName);
+                        DebugHelper.Write($"GenericMenu: [PartsEquip] robot switch: {robotName}");
+                    }
+                }
+                _lastPartsRobotPtr = robotPtr;
+
+                int selectType = (int)equipUI.currentSelectType;
+
+                // Mode changed (Equiped ↔ Select): reset cursors
+                if (selectType != _lastPartsSelectType)
+                {
+                    _lastPartsSelectType = selectType;
+                    _lastPartsSlotIndex = -1;
+                    _lastCursorIndex = -1;
+                    _stalePollCount = 0;
+                    DebugHelper.Write($"GenericMenu: [PartsEquip] selectType={selectType}");
+                }
+
+                if (selectType == 0) // Equiped: slot navigation
+                {
+                    int slotIndex = equipUI.selectSlotIndex;
+                    if (slotIndex != _lastPartsSlotIndex)
+                    {
+                        _lastPartsSlotIndex = slotIndex;
+                        _stalePollCount = 0;
+
+                        string text = ReadPartsSlotText(equipUI, slotIndex);
+                        if (!string.IsNullOrWhiteSpace(text))
+                        {
+                            ScreenReaderOutput.Say(text);
+                            _descriptionDelay = 3;
+                            _descriptionRetries = 0;
+                            _descriptionCursorIndex = slotIndex;
+                            DebugHelper.Write($"GenericMenu: [PartsEquip] slot={slotIndex} text={text}");
+                        }
+                        else
+                        {
+                            DebugHelper.Write($"GenericMenu: [PartsEquip] slot={slotIndex} no text");
+                        }
+                    }
+                }
+                else // Select: parts list navigation (existing behavior)
+                {
+                    int curIdx = equipUI.currentIndex;
+                    if (curIdx != _lastCursorIndex)
+                    {
+                        _lastCursorIndex = curIdx;
+                        _stalePollCount = 0;
+
+                        string text = null;
+                        if ((object)_listHandler != null)
+                            text = ReadPartsListItemText(curIdx);
+
+                        if (string.IsNullOrWhiteSpace(text))
+                            text = ReadListItemText(curIdx);
+
+                        if (!string.IsNullOrWhiteSpace(text))
+                        {
+                            ScreenReaderOutput.Say(text);
+                            _descriptionDelay = 3;
+                            _descriptionRetries = 0;
+                            DebugHelper.Write($"GenericMenu: [PartsEquip] list cursor={curIdx} text={text}");
+                        }
+                        else
+                        {
+                            DebugHelper.Write($"GenericMenu: [PartsEquip] list cursor={curIdx} no text");
+                        }
+                    }
                 }
             }
             catch (Exception ex)
@@ -1993,6 +2174,33 @@ namespace SRWYAccess
             {
                 var handler = _activeHandler.TryCast<PilotTrainingUIHandler>();
                 if ((object)handler == null) return false;
+
+                // Q/E pilot switch detection
+                IntPtr pilotPtr = IntPtr.Zero;
+                try
+                {
+                    var pilot = handler.currentPilot;
+                    if ((object)pilot != null)
+                        pilotPtr = pilot.Pointer;
+                }
+                catch { }
+
+                if (pilotPtr != _lastTrainingPilotPtr && _lastTrainingPilotPtr != IntPtr.Zero)
+                {
+                    _lastTrainingCursorIndex = -1;
+                    _stalePollCount = 0;
+
+                    string pilotName = null;
+                    if (pilotPtr != IntPtr.Zero)
+                        pilotName = SafeCall.ReadPilotNameSafe(pilotPtr);
+
+                    if (!string.IsNullOrWhiteSpace(pilotName))
+                    {
+                        ScreenReaderOutput.Say(pilotName);
+                        DebugHelper.Write($"GenericMenu: [PilotTraining] pilot switch: {pilotName}");
+                    }
+                }
+                _lastTrainingPilotPtr = pilotPtr;
 
                 // Detect tab change (Skill=0 vs Param=1)
                 int menuType = (int)handler.currentMenuType;
@@ -2882,6 +3090,71 @@ namespace SRWYAccess
                 _listHandler = null;
                 return null;
             }
+        }
+
+        /// <summary>
+        /// Read equipment slot info from PartsEquipEquipmentUIHandler.
+        /// Accesses unitBaseData.m_PartsList[slotIndex].m_PartsName TMP.
+        /// Returns "Slot N, partName" or "Slot N, Equipable" if empty.
+        /// </summary>
+        private string ReadPartsSlotText(PartsEquipEquipmentUIHandler equipUI, int slotIndex)
+        {
+            try
+            {
+                var unitBase = equipUI.unitBaseData;
+                if ((object)unitBase == null || unitBase.Pointer == IntPtr.Zero) return null;
+                if (!SafeCall.ProbeObject(unitBase.Pointer)) return null;
+
+                var partsList = unitBase.m_PartsList;
+                if ((object)partsList == null) return null;
+
+                int count;
+                try { count = partsList.Count; }
+                catch { return null; }
+                if (slotIndex < 0 || slotIndex >= count) return null;
+
+                var slotCol = partsList[slotIndex];
+                if ((object)slotCol == null || slotCol.Pointer == IntPtr.Zero) return null;
+                if (!SafeCall.ProbeObject(slotCol.Pointer)) return null;
+
+                string partName = null;
+                try
+                {
+                    var nameTmp = slotCol.m_PartsName;
+                    if ((object)nameTmp != null)
+                        partName = ReadTmpSafe(nameTmp);
+                }
+                catch { }
+
+                string slotLabel = Loc.Get("parts_slot", slotIndex + 1);
+
+                if (string.IsNullOrWhiteSpace(partName))
+                    return slotLabel + ", " + Loc.Get("parts_slot_empty");
+                else
+                    return slotLabel + ", " + partName;
+            }
+            catch { return null; }
+        }
+
+        /// <summary>
+        /// Read the explanation text from PartsEquipEquipmentUIHandler.
+        /// Used for deferred description reading in slot mode.
+        /// </summary>
+        private string ReadPartsEquipExplanation(PartsEquipUIHandler peHandler)
+        {
+            try
+            {
+                var equipUI = peHandler.equipmentUIHandler;
+                if ((object)equipUI == null || equipUI.Pointer == IntPtr.Zero) return null;
+
+                var expTmp = equipUI.explanationText;
+                if ((object)expTmp == null) return null;
+
+                string text = ReadTmpSafe(expTmp);
+                if (string.IsNullOrWhiteSpace(text)) return null;
+                return text;
+            }
+            catch { return null; }
         }
 
         /// <summary>
@@ -4263,27 +4536,11 @@ namespace SRWYAccess
         }
 
         /// <summary>
-        /// Read unit command text from UnitCommandUIHandler.buttonGuideText.
-        /// Falls back to ButtonType enum for localized command names.
+        /// Read unit command text from ButtonType enum via Loc.
+        /// Uses mod localization which tracks game language via LocalizationManager.GetLocaleID().
         /// </summary>
         private string ReadUnitCommandText(int index)
         {
-            try
-            {
-                var handler = _activeHandler.TryCast<UnitCommandUIHandler>();
-                if ((object)handler != null)
-                {
-                    var guideText = handler.buttonGuideText;
-                    if ((object)guideText != null && index >= 0 && index < guideText.Count)
-                    {
-                        string text = guideText[index];
-                        if (!string.IsNullOrWhiteSpace(text)) return text;
-                    }
-                }
-            }
-            catch { }
-
-            // Fallback: ButtonType enum
             switch (index)
             {
                 case 0: return Loc.Get("unit_robot_upgrade");
@@ -5729,11 +5986,16 @@ namespace SRWYAccess
                     sb.Append(personName);
                 }
 
-                // Add level and registered status from cached work data
+                // Add level: always use Loc format (TMP is bare number without prefix)
+                string levelText = null;
                 if (_cachedALLevel >= 0)
                 {
+                    levelText = Loc.Get("assistlink_level", _cachedALLevel + 1);
+                }
+                if (!string.IsNullOrWhiteSpace(levelText))
+                {
                     sb.Append(" ");
-                    sb.Append(Loc.Get("assistlink_level", _cachedALLevel + 1));
+                    sb.Append(levelText);
                 }
                 if (_cachedALRegistered)
                 {

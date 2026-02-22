@@ -28,6 +28,9 @@ namespace SRWYAccess
         private IntPtr _lastPawnPtr = IntPtr.Zero;
         private bool _cursorFound;
 
+        // Movement remaining tracking: announce remaining steps on every cursor move
+        private int _lastMoveRemaining = -1;
+
         // Public access for screen review
         public Vector2Int LastCoord => _lastCoord;
         public string LastUnitInfo => _lastUnitInfo;
@@ -38,6 +41,7 @@ namespace SRWYAccess
             _lastUnitInfo = null;
             _lastPawnPtr = IntPtr.Zero;
             _cursorFound = false;
+            _lastMoveRemaining = -1;
         }
 
         /// <summary>
@@ -51,9 +55,6 @@ namespace SRWYAccess
         {
             var cursor = GetFreshCursor();
             if ((object)cursor == null) return;
-
-            // Track unit cycling (Q/E, 1/3) via PawnController
-            CheckUnitChange();
 
             // Read current coord via direct field read (bypasses virtual dispatch)
             Vector2Int coord;
@@ -70,11 +71,137 @@ namespace SRWYAccess
                 return;
             }
 
-            if (coord.x == _lastCoord.x && coord.y == _lastCoord.y) return;
-            _lastCoord = coord;
+            bool coordChanged = coord.x != _lastCoord.x || coord.y != _lastCoord.y;
+            if (coordChanged)
+                _lastCoord = coord;
 
-            DebugHelper.Write($"TacticalMap: coord changed to {coord.x},{coord.y}, announcing");
-            AnnouncePosition(coord, cursor);
+            bool inMoveMode = IsInMovementMode();
+
+            if (inMoveMode)
+            {
+                // Movement mode: remaining steps + unit info in one Say call
+                if (coordChanged)
+                {
+                    PlayTileAudioCue(cursor);
+                    int remaining = GetMovementRemaining(coord);
+                    if (remaining != int.MinValue && remaining != _lastMoveRemaining)
+                    {
+                        _lastMoveRemaining = remaining;
+                        // Build combined message: "5" or "3, 正樹 / 賽巴斯塔 HP:..."
+                        var (unitInfo, _) = ReadUnitAtCursorWithSide(cursor);
+                        string msg = remaining.ToString();
+                        if (!string.IsNullOrEmpty(unitInfo))
+                            msg += ", " + unitInfo;
+                        ScreenReaderOutput.Say(msg);
+                    }
+                }
+            }
+            else
+            {
+                // Normal mode: track unit cycling + announce position
+                CheckUnitChange();
+                if (coordChanged)
+                {
+                    DebugHelper.Write($"TacticalMap: coord changed to {coord.x},{coord.y}, announcing");
+                    AnnouncePosition(coord, cursor);
+                }
+            }
+        }
+
+        /// <summary>
+        /// Check if PawnMoveCalculation.movePawnUnit is active (unit movement selection).
+        /// </summary>
+        private bool IsInMovementMode()
+        {
+            try
+            {
+                var mm = MapManager.Instance;
+                if ((object)mm == null || mm.Pointer == IntPtr.Zero || !SafeCall.ProbeObject(mm.Pointer))
+                    return false;
+                var board = mm.TacticalBoard;
+                if ((object)board == null || !SafeCall.ProbeObject(board.Pointer))
+                    return false;
+                var pmc = board.pawnMoveCalculation;
+                if ((object)pmc == null || !SafeCall.ProbeObject(pmc.Pointer))
+                    return false;
+                var movePawn = pmc.movePawnUnit;
+                return (object)movePawn != null && movePawn.Pointer != IntPtr.Zero
+                    && SafeCall.ProbeObject(movePawn.Pointer);
+            }
+            catch { return false; }
+        }
+
+        /// <summary>
+        /// Play audio cue for the tile at cursor (empty/ally/enemy) without text announcement.
+        /// </summary>
+        private void PlayTileAudioCue(FloatingCursor cursor)
+        {
+            var (_, isPlayerSide) = ReadUnitAtCursorWithSide(cursor);
+            if (isPlayerSide == null)
+                AudioCueManager.Play(AudioCue.TileEmpty);
+            else if (isPlayerSide == true)
+                AudioCueManager.Play(AudioCue.TileAlly);
+            else
+                AudioCueManager.Play(AudioCue.TileEnemy);
+        }
+
+        /// <summary>
+        /// Announce remaining movement steps during movement mode.
+        /// Called only when IsInMovementMode() is true.
+        /// Returns the remaining value (or int.MinValue if not available).
+        /// Caller is responsible for announcing.
+        /// </summary>
+        private int GetMovementRemaining(Vector2Int cursorCoord)
+        {
+            try
+            {
+                var mm = MapManager.Instance;
+                if ((object)mm == null || mm.Pointer == IntPtr.Zero) return int.MinValue;
+                var board = mm.TacticalBoard;
+                if ((object)board == null) return int.MinValue;
+                var pmc = board.pawnMoveCalculation;
+                if ((object)pmc == null) return int.MinValue;
+                var movePawn = pmc.movePawnUnit;
+                if ((object)movePawn == null || movePawn.Pointer == IntPtr.Zero) return int.MinValue;
+
+                int movePower = -1;
+                var moveStatus = pmc.moveStatus;
+                if ((object)moveStatus != null && SafeCall.ProbeObject(moveStatus.Pointer))
+                    movePower = moveStatus.MovePower;
+
+                if (movePower < 0)
+                {
+                    try
+                    {
+                        var pu = new PawnUnit(movePawn.Pointer);
+                        var pawn = pu.PawnData;
+                        if ((object)pawn != null)
+                        {
+                            var robot = pawn.BelongRobot;
+                            if ((object)robot != null)
+                            {
+                                var calcData = robot.calcData;
+                                if ((object)calcData != null && calcData.Pointer != IntPtr.Zero
+                                    && SafeCall.ProbeObject(calcData.Pointer))
+                                    movePower = calcData.MovePower;
+                            }
+                        }
+                    }
+                    catch { }
+                }
+
+                if (movePower < 0) return int.MinValue;
+
+                // Use Manhattan distance for consistent countdown
+                // (GetMovementRoute detours around units, causing erratic jumps)
+                var unitPos = movePawn.currentCoord;
+                int dist = Math.Abs(cursorCoord.x - unitPos.x) + Math.Abs(cursorCoord.y - unitPos.y);
+                return movePower - dist;
+            }
+            catch
+            {
+                return int.MinValue;
+            }
         }
 
         /// <summary>

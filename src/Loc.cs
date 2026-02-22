@@ -314,6 +314,52 @@ namespace SRWYAccess
                 "オーディオキューOFF",
                 "오디오 큐 꺼짐");
 
+            Add("battle_anim_label",
+                "Battle animation: ",
+                "战斗动画：",
+                "戰鬥動畫：",
+                "戦闘アニメ：",
+                "전투 애니메이션: ");
+
+            Add("battle_anim_on",
+                "Battle animation: On",
+                "战斗动画：开启",
+                "戰鬥動畫：開啟",
+                "戦闘アニメ：ON",
+                "전투 애니메이션: 켜짐");
+
+            Add("battle_anim_face",
+                "Battle animation: Face only",
+                "战斗动画：仅肖像",
+                "戰鬥動畫：僅肖像",
+                "戦闘アニメ：顔のみ",
+                "전투 애니메이션: 얼굴만");
+
+            Add("battle_anim_off",
+                "Battle animation: Off",
+                "战斗动画：关闭",
+                "戰鬥動畫：關閉",
+                "戦闘アニメ：OFF",
+                "전투 애니메이션: 꺼짐");
+
+            // Short direction names for path prediction (東3北4 style)
+            Add("dir_north", "N", "北", "北", "北", "북");
+            Add("dir_south", "S", "南", "南", "南", "남");
+            Add("dir_east", "E", "东", "東", "東", "동");
+            Add("dir_west", "W", "西", "西", "西", "서");
+            Add("path_same_position",
+                "Same position",
+                "相同位置",
+                "相同位置",
+                "同じ位置",
+                "같은 위치");
+            Add("path_no_unit",
+                "No unit selected",
+                "未选择机体",
+                "未選擇機體",
+                "ユニット未選択",
+                "유닛 미선택");
+
             Add("sort_type",
                 "Sort: {0}",
                 "排序：{0}",
@@ -623,6 +669,28 @@ namespace SRWYAccess
                 "退出遊戲",
                 "ゲーム終了",
                 "게임 종료");
+
+            // ===== SYSTEM OPTION PAGES =====
+            Add("option_page_game",
+                "Game Settings",
+                "游戏设置",
+                "遊戲設定",
+                "ゲーム設定",
+                "게임 설정");
+
+            Add("option_page_sound",
+                "Sound Settings",
+                "声音设置",
+                "聲音設定",
+                "サウンド設定",
+                "사운드 설정");
+
+            Add("option_page_screen",
+                "Screen Settings",
+                "画面设置",
+                "畫面設定",
+                "画面設定",
+                "화면 설정");
 
             // ===== GAME OVER =====
             Add("state_game_over",
@@ -1920,6 +1988,20 @@ namespace SRWYAccess
                 "效果：{0}",
                 "効果：{0}",
                 "효과: {0}");
+
+            Add("parts_slot",
+                "Slot {0}",
+                "插槽 {0}",
+                "插槽 {0}",
+                "スロット {0}",
+                "슬롯 {0}");
+
+            Add("parts_slot_empty",
+                "Equipable",
+                "可装备",
+                "可裝備",
+                "装備可能",
+                "장비 가능");
 
             // ===== DIFFICULTY SELECTION =====
             Add("difficulty_description",

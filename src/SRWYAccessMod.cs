@@ -10,6 +10,7 @@ using Il2CppCom.BBStudio.SRTeam.Inputs;
 using Il2CppCom.BBStudio.SRTeam.Map;
 using Il2CppCom.BBStudio.SRTeam.Data;
 using Il2CppCom.BBStudio.SRTeam.UIs;
+using Il2CppCom.BBStudio.SRTeam.UI.StrategyPart.Option;
 using MonoMod.RuntimeDetour;
 
 [assembly: MelonInfo(typeof(SRWYAccess.SRWYAccessMod), "SRWYAccess", "0.2.0", "SRWYAccess Team")]
@@ -117,6 +118,14 @@ namespace SRWYAccess
         [DllImport("user32.dll")]
         private static extern short GetAsyncKeyState(int vKey);
 
+        [DllImport("user32.dll")]
+        private static extern IntPtr GetForegroundWindow();
+
+        [DllImport("user32.dll")]
+        private static extern uint GetWindowThreadProcessId(IntPtr hWnd, out uint processId);
+
+        private static uint _currentProcessId;
+
         private const int VK_OEM_4 = 0xDB; // [ key
         private const int VK_OEM_6 = 0xDD; // ] key
         private const int VK_R = 0x52;     // R key
@@ -125,6 +134,7 @@ namespace SRWYAccess
         private const int VK_OEM_PERIOD = 0xBE; // . key (prev ally)
         private const int VK_OEM_2 = 0xBF; // / key (next ally)
         private const int VK_OEM_5 = 0xDC; // \ key (repeat last distance)
+        private const int VK_P = 0x50;    // P key (path prediction to last target)
         private const int VK_SHIFT = 0x10;   // Shift modifier
         private const int VK_CONTROL = 0x11; // Ctrl modifier
 
@@ -155,6 +165,7 @@ namespace SRWYAccess
         private static UnitDistanceHandler _unitDistanceHandler;
         private static ScreenReviewManager _screenReviewManager;
         private static SupporterHandler _supporterHandler;
+        private static SystemOptionHandler _systemOptionHandler;
 
         // Main thread state (only accessed from main thread after _initialized = true)
         private static int _frameCount;
@@ -192,6 +203,7 @@ namespace SRWYAccess
         private static bool _lastKeyPeriod;
         private static bool _lastKeySlash;
         private static bool _lastKeyBackslash;
+        private static bool _lastKeyP;
         private static bool _lastKeyQ;
         private static bool _lastKeyE;
         private static bool _lastKey1;
@@ -204,6 +216,7 @@ namespace SRWYAccess
         private static bool _lastKeyF4;
         private static bool _modEnabled = true;
         private static bool _isInLoadingState; // guards CheckReviewKeys during transitions
+        private static int _lastBattleAnimSetting = -99; // tracks EBattleAnimation changes
 
         // Crash breadcrumb: tracks execution stage in OnMainThreadUpdate.
         // Logged with each heartbeat. On process-level crash, the last heartbeat
@@ -529,6 +542,7 @@ namespace SRWYAccess
                 _tacticalMapHandler = new TacticalMapHandler();
                 _unitDistanceHandler = new UnitDistanceHandler();
                 _supporterHandler = new SupporterHandler();
+                _systemOptionHandler = new SystemOptionHandler();
                 _screenReviewManager = new ScreenReviewManager(
                     _genericMenuReader, _dialogHandler, _tutorialHandler,
                     _adventureDialogueHandler, _battleSubtitleHandler,
@@ -591,6 +605,9 @@ namespace SRWYAccess
                 DebugHelper.Close();
             };
 
+            // Cache current process ID for focus detection
+            _currentProcessId = (uint)Environment.ProcessId;
+
             // Phase 9: Activate main thread updates
             _initialized = true;
             ScreenReaderOutput.Say(Loc.Get("mod_loaded"));
@@ -618,6 +635,10 @@ namespace SRWYAccess
         {
             if (!_initialized || _shutdownRequested) return;
 
+            // Skip all mod logic when game window is not focused.
+            // GetAsyncKeyState is global and would capture keys from other apps.
+            if (!IsGameFocused()) return;
+
             // Mod hotkeys: F2 toggle, F3 reload - checked every frame, even when disabled
             CheckModHotkeys();
 
@@ -638,6 +659,8 @@ namespace SRWYAccess
 
             // Re-check language until SaveLoadManager data is available
             Loc.TryConfirmLanguage();
+
+            // Battle animation toggle is handled in BattleCheckMenuHandler (demoText).
 
             // Safe mode: only handle basic functionality
             if (_safeMode)
@@ -946,6 +969,9 @@ namespace SRWYAccess
                 // Supporter handler (MonoBehaviour-based, not found by GenericMenuReader)
                 _supporterHandler?.Update(canSearchMenu);
 
+                // System option handler (column-based cursor + value tracking)
+                _systemOptionHandler?.Update(canSearchMenu);
+
                 _breadcrumb = 42; // GenericMenuReader done
                 if (menuLost)
                 {
@@ -1185,6 +1211,7 @@ namespace SRWYAccess
             _unitDistanceHandler?.ReleaseHandler();
             _supporterHandler?.ReleaseHandler();
             _mapWeaponTargetHandler?.Reset();
+            _systemOptionHandler?.ReleaseHandler();
             if (!keepResultHandler)
                 _battleResultHandler?.ReleaseHandler();
         }
@@ -1311,6 +1338,14 @@ namespace SRWYAccess
             ScreenReaderOutput.Say(Loc.Get("turn_summary_none"));
         }
 
+        private static bool IsGameFocused()
+        {
+            IntPtr fg = GetForegroundWindow();
+            if (fg == IntPtr.Zero) return false;
+            GetWindowThreadProcessId(fg, out uint pid);
+            return pid == _currentProcessId;
+        }
+
         private static void CheckModHotkeys()
         {
             bool keyF2 = (GetAsyncKeyState(VK_F2) & 0x8000) != 0;
@@ -1349,6 +1384,62 @@ namespace SRWYAccess
             _lastKeyF2 = keyF2;
             _lastKeyF3 = keyF3;
             _lastKeyF4 = keyF4;
+        }
+
+        private static bool _battleAnimCheckFailed;
+        private static int _battleAnimPollCount;
+        private static void CheckBattleAnimationSetting()
+        {
+            if (_battleAnimCheckFailed) return;
+            try
+            {
+                int current = -1;
+                // Method 1: OptionDataEx.BattleAnimation() static method
+                try
+                {
+                    current = (int)OptionDataEx.BattleAnimation();
+                }
+                catch
+                {
+                    // Method 2: OptionDataEx.PlayerSettings().battleAnimation
+                    try
+                    {
+                        var ps = OptionDataEx.PlayerSettings();
+                        if ((object)ps != null && ps.Pointer != IntPtr.Zero)
+                            current = ps.battleAnimation;
+                    }
+                    catch (Exception ex2)
+                    {
+                        DebugHelper.Write($"BattleAnim: all methods failed: {ex2.GetType().Name}: {ex2.Message}");
+                        _battleAnimCheckFailed = true;
+                        return;
+                    }
+                }
+                _battleAnimPollCount++;
+                // Diagnostic: log value every ~15s
+                if (_battleAnimPollCount % 30 == 0)
+                    DebugHelper.Write($"BattleAnim: poll #{_battleAnimPollCount} current={current} last={_lastBattleAnimSetting}");
+                if (current < 0) return;
+                if (current == _lastBattleAnimSetting) return;
+                int prev = _lastBattleAnimSetting;
+                _lastBattleAnimSetting = current;
+                DebugHelper.Write($"BattleAnim: changed {prev} -> {current}");
+                if (prev == -99) return; // skip first read
+                string key = current switch
+                {
+                    0 => "battle_anim_on",
+                    1 => "battle_anim_face",
+                    2 => "battle_anim_off",
+                    _ => null
+                };
+                if (key != null)
+                    ScreenReaderOutput.Say(Loc.Get(key));
+            }
+            catch (Exception ex)
+            {
+                DebugHelper.Write($"BattleAnim: error: {ex.GetType().Name}: {ex.Message}");
+                _battleAnimCheckFailed = true;
+            }
         }
 
         private static void ResetModState()
@@ -1473,6 +1564,7 @@ namespace SRWYAccess
                 _lastKeyPeriod = false;
                 _lastKeySlash = false;
                 _lastKeyBackslash = false;
+                _lastKeyP = false;
                 return;
             }
 
@@ -1485,6 +1577,7 @@ namespace SRWYAccess
                 _lastKeyPeriod = false;
                 _lastKeySlash = false;
                 _lastKeyBackslash = false;
+                _lastKeyP = false;
                 return;
             }
 
@@ -1564,6 +1657,18 @@ namespace SRWYAccess
                 if (!string.IsNullOrEmpty(msg))
                     ScreenReaderOutput.Say(msg);
             }
+
+            // P key: path prediction to last queried target
+            bool keyP = (GetAsyncKeyState(VK_P) & 0x8000) != 0;
+            if (keyP && !_lastKeyP)
+            {
+                string path = _unitDistanceHandler.GetPathToLastTarget(cursorCoord);
+                if (!string.IsNullOrEmpty(path))
+                    ScreenReaderOutput.Say(path);
+                else
+                    ScreenReaderOutput.Say(Loc.Get("path_no_unit"));
+            }
+            _lastKeyP = keyP;
 
             _lastKeySemicolon = keySemicolon;
             _lastKeyApostrophe = keyApostrophe;
