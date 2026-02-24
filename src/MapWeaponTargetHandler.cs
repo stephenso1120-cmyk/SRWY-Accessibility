@@ -20,8 +20,8 @@ namespace SRWYAccess
     /// (indicating direction was rotated).
     ///
     /// Hotkeys (called from SRWYAccessMod):
-    ///   Shift+; → ReadEnemyNames (list enemy unit names in range)
-    ///   Shift+' → ReadAllyNames (list ally unit names in range)
+    ///   Alt+; → ReadEnemyNames (list enemy unit names in range)
+    ///   Alt+' → ReadAllyNames (list ally unit names in range)
     ///
     /// SAFETY: All IL2CPP null checks use (object)x != null.
     /// All property access wrapped in try/catch.

@@ -1,6 +1,6 @@
 # SRWYAccess - Super Robot Wars Y Accessibility Mod
 
-Version: 2.3
+Version: 2.3.5
 Game: Super Robot Wars Y (Steam)
 Supported Languages: English, Simplified Chinese, Traditional Chinese, Japanese, Korean
 
@@ -73,8 +73,10 @@ Place files from the release archive:
 
 - ;: Cycle to previous enemy (sorted by distance)
 - ': Cycle to next enemy
-- Shift+;: Read enemies in MAP weapon range
-- Shift+': Read allies in MAP weapon range
+- Alt+;: Cycle to previous named/boss enemy
+- Alt+': Cycle to next named/boss enemy
+- Ctrl+;: Cycle to previous enemy (sorted by lowest HP)
+- Ctrl+': Cycle to next enemy (sorted by lowest HP)
 
 ### Tactical Map: Ally Distance
 
@@ -83,10 +85,14 @@ Place files from the release archive:
 
 ### Tactical Map: Unacted/Acted Units
 
-- Shift+.: Previous unacted player unit
-- Shift+/: Next unacted player unit
+- Alt+.: Previous unacted player unit
+- Alt+/: Next unacted player unit
 - Ctrl+.: Previous acted player unit
 - Ctrl+/: Next acted player unit
+
+### Tactical Map: Mission Destination
+
+- Alt+\: Announce direction and distance to mission destination points
 
 ### Tactical Map: Other
 
@@ -142,6 +148,21 @@ Place files from the release archive:
 ### Window Focus
 
 - Mod pauses when the game window is not focused (Alt-Tab safe)
+
+## Changelog
+
+### v2.3.5 (2026-02-24)
+
+- New: Alt+\ announces direction and distance to mission destination points on tactical map
+- New: Alt+;/' cycles through named/boss enemy units
+- New: Ctrl+;/' cycles through enemies sorted by lowest HP
+- Changed: Modifier key for unacted/acted units changed from Shift to Alt (Alt+.// and Ctrl+.//)
+
+### v2.3 (2026-02-22)
+
+- System options menu reading with setting descriptions and value changes
+- Parts equip slot reading with part descriptions
+- Q/E unit/pilot name switching announcements
 
 ## FAQ
 

@@ -13,7 +13,7 @@ using Il2CppCom.BBStudio.SRTeam.UIs;
 using Il2CppCom.BBStudio.SRTeam.UI.StrategyPart.Option;
 using MonoMod.RuntimeDetour;
 
-[assembly: MelonInfo(typeof(SRWYAccess.SRWYAccessMod), "SRWYAccess", "0.2.0", "SRWYAccess Team")]
+[assembly: MelonInfo(typeof(SRWYAccess.SRWYAccessMod), "SRWYAccess", "2.3.5", "SRWYAccess Team")]
 [assembly: MelonGame("Bandai Namco Entertainment", "SUPER ROBOT WARS Y")]
 
 namespace SRWYAccess
@@ -135,7 +135,7 @@ namespace SRWYAccess
         private const int VK_OEM_2 = 0xBF; // / key (next ally)
         private const int VK_OEM_5 = 0xDC; // \ key (repeat last distance)
         private const int VK_P = 0x50;    // P key (path prediction to last target)
-        private const int VK_SHIFT = 0x10;   // Shift modifier
+        private const int VK_MENU = 0x12;    // Alt modifier
         private const int VK_CONTROL = 0x11; // Ctrl modifier
 
         private const int VK_Q = 0x51;    // Q key (L1 - tab switch left)
@@ -1586,9 +1586,10 @@ namespace SRWYAccess
             bool keyPeriod = (GetAsyncKeyState(VK_OEM_PERIOD) & 0x8000) != 0;
             bool keySlash = (GetAsyncKeyState(VK_OEM_2) & 0x8000) != 0;
             bool keyBackslash = (GetAsyncKeyState(VK_OEM_5) & 0x8000) != 0;
-            bool shiftHeld = (GetAsyncKeyState(VK_SHIFT) & 0x8000) != 0;
+            bool altHeld = (GetAsyncKeyState(VK_MENU) & 0x8000) != 0;
             bool ctrlHeld = (GetAsyncKeyState(VK_CONTROL) & 0x8000) != 0;
 
+            // ; key: Alt=named enemies, Ctrl=enemies by lowest HP, plain=all enemies
             if (keySemicolon && !_lastKeySemicolon)
             {
                 if (_mapWeaponTargetHandler != null && _mapWeaponTargetHandler.IsActive)
@@ -1600,12 +1601,19 @@ namespace SRWYAccess
                 }
                 else
                 {
-                    string msg = _unitDistanceHandler.CycleEnemy(-1, cursorCoord);
+                    string msg;
+                    if (altHeld)
+                        msg = _unitDistanceHandler.CycleNamedEnemy(-1, cursorCoord);
+                    else if (ctrlHeld)
+                        msg = _unitDistanceHandler.CycleEnemyByHp(-1, cursorCoord);
+                    else
+                        msg = _unitDistanceHandler.CycleEnemy(-1, cursorCoord);
                     if (!string.IsNullOrEmpty(msg))
                         ScreenReaderOutput.Say(msg);
                 }
             }
 
+            // ' key: Alt=named enemies, Ctrl=enemies by lowest HP, plain=all enemies
             if (keyApostrophe && !_lastKeyApostrophe)
             {
                 if (_mapWeaponTargetHandler != null && _mapWeaponTargetHandler.IsActive)
@@ -1617,17 +1625,23 @@ namespace SRWYAccess
                 }
                 else
                 {
-                    string msg = _unitDistanceHandler.CycleEnemy(1, cursorCoord);
+                    string msg;
+                    if (altHeld)
+                        msg = _unitDistanceHandler.CycleNamedEnemy(1, cursorCoord);
+                    else if (ctrlHeld)
+                        msg = _unitDistanceHandler.CycleEnemyByHp(1, cursorCoord);
+                    else
+                        msg = _unitDistanceHandler.CycleEnemy(1, cursorCoord);
                     if (!string.IsNullOrEmpty(msg))
                         ScreenReaderOutput.Say(msg);
                 }
             }
 
-            // . key: Shift=unacted, Ctrl=acted, plain=ally distance
+            // . key: Alt=unacted, Ctrl=acted, plain=ally distance
             if (keyPeriod && !_lastKeyPeriod)
             {
                 string msg;
-                if (shiftHeld)
+                if (altHeld)
                     msg = _unitDistanceHandler.CycleUnacted(-1, cursorCoord);
                 else if (ctrlHeld)
                     msg = _unitDistanceHandler.CycleActed(-1, cursorCoord);
@@ -1637,11 +1651,11 @@ namespace SRWYAccess
                     ScreenReaderOutput.Say(msg);
             }
 
-            // / key: Shift=unacted, Ctrl=acted, plain=ally distance
+            // / key: Alt=unacted, Ctrl=acted, plain=ally distance
             if (keySlash && !_lastKeySlash)
             {
                 string msg;
-                if (shiftHeld)
+                if (altHeld)
                     msg = _unitDistanceHandler.CycleUnacted(1, cursorCoord);
                 else if (ctrlHeld)
                     msg = _unitDistanceHandler.CycleActed(1, cursorCoord);
@@ -1653,9 +1667,21 @@ namespace SRWYAccess
 
             if (keyBackslash && !_lastKeyBackslash)
             {
-                string msg = _unitDistanceHandler.RepeatLast(cursorCoord);
-                if (!string.IsNullOrEmpty(msg))
-                    ScreenReaderOutput.Say(msg);
+                if (altHeld)
+                {
+                    // Alt+\: announce mission destination point direction/distance
+                    DebugHelper.Write($"Alt+\\ pressed at cursor ({cursorCoord.x},{cursorCoord.y})");
+                    string msg = _unitDistanceHandler.GetMissionPointInfo(cursorCoord);
+                    DebugHelper.Write($"Alt+\\ result: {msg}");
+                    if (!string.IsNullOrEmpty(msg))
+                        ScreenReaderOutput.Say(msg);
+                }
+                else
+                {
+                    string msg = _unitDistanceHandler.RepeatLast(cursorCoord);
+                    if (!string.IsNullOrEmpty(msg))
+                        ScreenReaderOutput.Say(msg);
+                }
             }
 
             // P key: path prediction to last queried target

@@ -2305,6 +2305,13 @@ namespace SRWYAccess
                 "行動済 {0}/{1}：{2}、{3} 距離 {4}",
                 "행동완료 {0}/{1}: {2}, {3} 거리 {4}");
 
+            Add("dist_no_named_enemies",
+                "No named enemies",
+                "没有特殊敌方单位",
+                "沒有特殊敵方單位",
+                "ネームド敵ユニットなし",
+                "네임드 적 유닛 없음");
+
             Add("dist_no_unacted",
                 "No unacted units",
                 "没有未行动单位",
@@ -2484,6 +2491,30 @@ namespace SRWYAccess
                 "{0}: {1} -> {2}",
                 "{0}: {1} → {2}",
                 "{0}: {1} -> {2}");
+
+            // ===== MISSION POINT DESTINATION (Alt+\) =====
+            Add("mission_point_none",
+                "No destination points",
+                "没有目标地点",
+                "沒有目標地點",
+                "目標地点なし",
+                "목표 지점 없음");
+
+            // {0}=index, {1}=total, {2}=name, {3}=direction, {4}=distance, {5}=detailed path
+            Add("mission_point_info_named",
+                "Dest {0}/{1}: {2}, {3} distance {4}, {5}",
+                "目标 {0}/{1}：{2}，{3} 距离 {4}，{5}",
+                "目標 {0}/{1}：{2}，{3} 距離 {4}，{5}",
+                "目標 {0}/{1}：{2}、{3} 距離 {4}、{5}",
+                "목표 {0}/{1}: {2}, {3} 거리 {4}, {5}");
+
+            // {0}=index, {1}=total, {2}=direction, {3}=distance, {4}=detailed path
+            Add("mission_point_info",
+                "Dest {0}/{1}: {2} distance {3}, {4}",
+                "目标 {0}/{1}：{2} 距离 {3}，{4}",
+                "目標 {0}/{1}：{2} 距離 {3}，{4}",
+                "目標 {0}/{1}：{2} 距離 {3}、{4}",
+                "목표 {0}/{1}: {2} 거리 {3}, {4}");
 
             // EButtonIndex stat names (order: HP=0, EN=1, AR=2, MO=3, SI=4, WP=5)
             Add("custom_stat_hp", "HP", "HP", "HP", "HP", "HP");

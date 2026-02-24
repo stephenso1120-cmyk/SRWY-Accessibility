@@ -2,7 +2,7 @@
 SRWYAccess - Super Robot Wars Y Accessibility Mod
 ========================================
 
-Version: 2.3
+Version: 2.3.5
 Game: Super Robot Wars Y
 Supported Languages: English, Simplified Chinese, Traditional Chinese, Japanese, Korean
 
@@ -192,8 +192,13 @@ I: Read selected unit stats
 ' (Apostrophe): Cycle to next enemy unit
   - Same as above, cycles in the opposite direction
 
-Shift + Semicolon: Read enemy names in MAP weapon range
-Shift + Apostrophe: Read ally names in MAP weapon range
+Alt + Semicolon: Cycle to previous named/boss enemy unit
+Alt + Apostrophe: Cycle to next named/boss enemy unit
+  - Only cycles through special/named enemy units (bosses, etc.)
+
+Ctrl + Semicolon: Cycle to previous enemy (sorted by lowest HP)
+Ctrl + Apostrophe: Cycle to next enemy (sorted by lowest HP)
+  - Helps find weakened enemy units to finish off
 
 --- Tactical Map: Ally Unit Distance ---
 
@@ -206,13 +211,19 @@ Shift + Apostrophe: Read ally names in MAP weapon range
 
 --- Tactical Map: Unacted/Acted Units ---
 
-Shift + Period: Cycle to previous unacted player unit
-Shift + Slash: Cycle to next unacted player unit
+Alt + Period: Cycle to previous unacted player unit
+Alt + Slash: Cycle to next unacted player unit
   - Helps find units that can still act this turn
 
 Ctrl + Period: Cycle to previous acted player unit
 Ctrl + Slash: Cycle to next acted player unit
   - Helps check which units have already acted
+
+--- Tactical Map: Mission Destination ---
+Alt + Backslash: Announce mission destination point direction/distance
+  - Shows direction, distance, and path to mission objective points
+  - Useful for missions that require moving units to specific locations
+  - Sorted by nearest destination first
 
 --- Distance General ---
 \ (Backslash): Repeat last distance announcement
@@ -374,17 +385,21 @@ I: Unit stats
 
 ;: Previous enemy
 ': Next enemy
+Alt+;: Previous named enemy
+Alt+': Next named enemy
+Ctrl+;: Previous enemy (by HP)
+Ctrl+': Next enemy (by HP)
+
 .: Previous ally
 /: Next ally
-\: Repeat last
-P: Path prediction
-
-Shift+;: Enemies in range
-Shift+': Allies in range
-Shift+.: Previous unacted
-Shift+/: Next unacted
+Alt+.: Previous unacted
+Alt+/: Next unacted
 Ctrl+.: Previous acted
 Ctrl+/: Next acted
+
+\: Repeat last
+Alt+\: Mission destination
+P: Path prediction
 
 =: Movement range
 -: Attack range

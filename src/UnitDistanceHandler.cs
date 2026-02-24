@@ -21,12 +21,14 @@ namespace SRWYAccess
     /// </summary>
     public class UnitDistanceHandler
     {
-        private enum LastListType { Enemy, Ally, Unacted, Acted }
+        private enum LastListType { Enemy, Ally, Unacted, Acted, NamedEnemy, EnemyByHp }
 
         private int _enemyIndex = -1;
         private int _allyIndex = -1;
         private int _unactedIndex = -1;
         private int _actedIndex = -1;
+        private int _namedEnemyIndex = -1;
+        private int _enemyByHpIndex = -1;
         private LastListType _lastList = LastListType.Enemy; // tracks which list \ key re-announces
         private Vector2Int _lastCursorCoord = new Vector2Int(-999, -999);
 
@@ -35,16 +37,22 @@ namespace SRWYAccess
         private List<UnitInfo> _cachedAllies;
         private List<UnitInfo> _cachedUnacted;
         private List<UnitInfo> _cachedActed;
+        private List<UnitInfo> _cachedNamedEnemies;
+        private List<UnitInfo> _cachedEnemyByHp;
         private Vector2Int _cachedEnemyCoord = new Vector2Int(-999, -999);
         private Vector2Int _cachedAllyCoord = new Vector2Int(-999, -999);
         private Vector2Int _cachedUnactedCoord = new Vector2Int(-999, -999);
         private Vector2Int _cachedActedCoord = new Vector2Int(-999, -999);
+        private Vector2Int _cachedNamedEnemyCoord = new Vector2Int(-999, -999);
+        private Vector2Int _cachedEnemyByHpCoord = new Vector2Int(-999, -999);
 
         // Track last-announced unit pointers for RepeatLast unit tracking
         private IntPtr _lastEnemyPtr = IntPtr.Zero;
         private IntPtr _lastAllyPtr = IntPtr.Zero;
         private IntPtr _lastUnactedPtr = IntPtr.Zero;
         private IntPtr _lastActedPtr = IntPtr.Zero;
+        private IntPtr _lastNamedEnemyPtr = IntPtr.Zero;
+        private IntPtr _lastEnemyByHpPtr = IntPtr.Zero;
 
         private struct UnitInfo
         {
@@ -56,6 +64,8 @@ namespace SRWYAccess
             public int HpNow;
             public int HpMax;
             public bool HasHp;
+            public bool IsCommonSoldier;
+            public bool IsCommonSoldierKnown; // true if we successfully read the field
         }
 
         public void ReleaseHandler()
@@ -64,20 +74,28 @@ namespace SRWYAccess
             _allyIndex = -1;
             _unactedIndex = -1;
             _actedIndex = -1;
+            _namedEnemyIndex = -1;
+            _enemyByHpIndex = -1;
             _lastList = LastListType.Enemy;
             _lastCursorCoord = new Vector2Int(-999, -999);
             _cachedEnemies = null;
             _cachedAllies = null;
             _cachedUnacted = null;
             _cachedActed = null;
+            _cachedNamedEnemies = null;
+            _cachedEnemyByHp = null;
             _cachedEnemyCoord = new Vector2Int(-999, -999);
             _cachedAllyCoord = new Vector2Int(-999, -999);
             _cachedUnactedCoord = new Vector2Int(-999, -999);
             _cachedActedCoord = new Vector2Int(-999, -999);
+            _cachedNamedEnemyCoord = new Vector2Int(-999, -999);
+            _cachedEnemyByHpCoord = new Vector2Int(-999, -999);
             _lastEnemyPtr = IntPtr.Zero;
             _lastAllyPtr = IntPtr.Zero;
             _lastUnactedPtr = IntPtr.Zero;
             _lastActedPtr = IntPtr.Zero;
+            _lastNamedEnemyPtr = IntPtr.Zero;
+            _lastEnemyByHpPtr = IntPtr.Zero;
         }
 
         /// <summary>
@@ -209,6 +227,102 @@ namespace SRWYAccess
         }
 
         /// <summary>
+        /// Cycle to next/previous named (non-generic) enemy unit.
+        /// Filters out common soldiers (isCommonSoldier=true) via PilotBaseData.
+        /// </summary>
+        public string CycleNamedEnemy(int direction, Vector2Int cursorCoord)
+        {
+            CheckCursorMoved(cursorCoord);
+
+            if (_cachedNamedEnemies == null || cursorCoord.x != _cachedNamedEnemyCoord.x || cursorCoord.y != _cachedNamedEnemyCoord.y)
+            {
+                var allEnemies = BuildUnitList(cursorCoord, isEnemy: true);
+
+                // Count pilot names (part before " / ") to detect mass-produced units
+                var pilotCounts = new Dictionary<string, int>();
+                foreach (var u in allEnemies)
+                {
+                    string pilotName = ExtractPilotName(u.Name);
+                    if (pilotCounts.ContainsKey(pilotName))
+                        pilotCounts[pilotName]++;
+                    else
+                        pilotCounts[pilotName] = 1;
+                }
+
+                // Filter: exclude isCommonSoldier=true AND exclude duplicate pilot names
+                _cachedNamedEnemies = allEnemies.FindAll(u =>
+                {
+                    // Exclude if known common soldier
+                    if (u.IsCommonSoldierKnown && u.IsCommonSoldier) return false;
+                    // Exclude if pilot name appears more than once (mass-produced)
+                    string pilotName = ExtractPilotName(u.Name);
+                    if (pilotCounts[pilotName] > 1) return false;
+                    return true;
+                });
+                _cachedNamedEnemyCoord = cursorCoord;
+            }
+
+            if (_cachedNamedEnemies == null || _cachedNamedEnemies.Count == 0)
+                return Loc.Get("dist_no_named_enemies");
+
+            if (_namedEnemyIndex < 0)
+                _namedEnemyIndex = 0;
+            else
+            {
+                _namedEnemyIndex += direction;
+                if (_namedEnemyIndex >= _cachedNamedEnemies.Count) _namedEnemyIndex = 0;
+                if (_namedEnemyIndex < 0) _namedEnemyIndex = _cachedNamedEnemies.Count - 1;
+            }
+
+            _lastList = LastListType.NamedEnemy;
+            _lastNamedEnemyPtr = _cachedNamedEnemies[_namedEnemyIndex].Pointer;
+            return FormatAnnouncement(_cachedNamedEnemies[_namedEnemyIndex], _namedEnemyIndex, _cachedNamedEnemies.Count, isEnemy: true);
+        }
+
+        /// <summary>
+        /// Cycle to next/previous enemy unit sorted by HP ascending (lowest first).
+        /// </summary>
+        public string CycleEnemyByHp(int direction, Vector2Int cursorCoord)
+        {
+            CheckCursorMoved(cursorCoord);
+
+            if (_cachedEnemyByHp == null || cursorCoord.x != _cachedEnemyByHpCoord.x || cursorCoord.y != _cachedEnemyByHpCoord.y)
+            {
+                _cachedEnemyByHp = BuildUnitList(cursorCoord, isEnemy: true);
+                // Sort by HP ascending (lowest HP first)
+                _cachedEnemyByHp.Sort((a, b) =>
+                {
+                    // Units with HP info come first
+                    if (a.HasHp && !b.HasHp) return -1;
+                    if (!a.HasHp && b.HasHp) return 1;
+                    if (a.HasHp && b.HasHp)
+                    {
+                        int cmp = a.HpNow.CompareTo(b.HpNow);
+                        if (cmp != 0) return cmp;
+                    }
+                    return string.Compare(a.Name, b.Name, StringComparison.Ordinal);
+                });
+                _cachedEnemyByHpCoord = cursorCoord;
+            }
+
+            if (_cachedEnemyByHp == null || _cachedEnemyByHp.Count == 0)
+                return Loc.Get("dist_no_enemies");
+
+            if (_enemyByHpIndex < 0)
+                _enemyByHpIndex = 0;
+            else
+            {
+                _enemyByHpIndex += direction;
+                if (_enemyByHpIndex >= _cachedEnemyByHp.Count) _enemyByHpIndex = 0;
+                if (_enemyByHpIndex < 0) _enemyByHpIndex = _cachedEnemyByHp.Count - 1;
+            }
+
+            _lastList = LastListType.EnemyByHp;
+            _lastEnemyByHpPtr = _cachedEnemyByHp[_enemyByHpIndex].Pointer;
+            return FormatAnnouncement(_cachedEnemyByHp[_enemyByHpIndex], _enemyByHpIndex, _cachedEnemyByHp.Count, isEnemy: true);
+        }
+
+        /// <summary>
         /// Re-announce the currently selected unit.
         /// If cursor hasn't moved, re-announce from cache (no rebuild).
         /// If cursor has moved, rebuild the relevant list, find the same unit
@@ -227,10 +341,14 @@ namespace SRWYAccess
                 _allyIndex = -1;
                 _unactedIndex = -1;
                 _actedIndex = -1;
+                _namedEnemyIndex = -1;
+                _enemyByHpIndex = -1;
                 _cachedEnemies = null;
                 _cachedAllies = null;
                 _cachedUnacted = null;
                 _cachedActed = null;
+                _cachedNamedEnemies = null;
+                _cachedEnemyByHp = null;
             }
 
             switch (_lastList)
@@ -266,6 +384,36 @@ namespace SRWYAccess
                         () => BuildActionFilteredList(cursorCoord, canAct: false),
                         "dist_no_acted",
                         (u, i, t) => FormatActionAnnouncement(u, i, t, isUnacted: false));
+
+                case LastListType.NamedEnemy:
+                    return RepeatFromList(
+                        ref _cachedNamedEnemies, ref _cachedNamedEnemyCoord, ref _namedEnemyIndex, ref _lastNamedEnemyPtr,
+                        cursorCoord, cursorMoved,
+                        () => {
+                            var all = BuildUnitList(cursorCoord, isEnemy: true);
+                            var pc = new Dictionary<string, int>();
+                            foreach (var u in all) { string pn = ExtractPilotName(u.Name); if (pc.ContainsKey(pn)) pc[pn]++; else pc[pn] = 1; }
+                            return all.FindAll(u => !(u.IsCommonSoldierKnown && u.IsCommonSoldier) && pc[ExtractPilotName(u.Name)] == 1);
+                        },
+                        "dist_no_named_enemies",
+                        (u, i, t) => FormatAnnouncement(u, i, t, isEnemy: true));
+
+                case LastListType.EnemyByHp:
+                    return RepeatFromList(
+                        ref _cachedEnemyByHp, ref _cachedEnemyByHpCoord, ref _enemyByHpIndex, ref _lastEnemyByHpPtr,
+                        cursorCoord, cursorMoved,
+                        () => {
+                            var list = BuildUnitList(cursorCoord, isEnemy: true);
+                            list.Sort((a, b) => {
+                                if (a.HasHp && !b.HasHp) return -1;
+                                if (!a.HasHp && b.HasHp) return 1;
+                                if (a.HasHp && b.HasHp) { int cmp = a.HpNow.CompareTo(b.HpNow); if (cmp != 0) return cmp; }
+                                return string.Compare(a.Name, b.Name, StringComparison.Ordinal);
+                            });
+                            return list;
+                        },
+                        "dist_no_enemies",
+                        (u, i, t) => FormatAnnouncement(u, i, t, isEnemy: true));
 
                 default:
                     return Loc.Get("dist_no_enemies");
@@ -310,11 +458,15 @@ namespace SRWYAccess
                 _allyIndex = -1;
                 _unactedIndex = -1;
                 _actedIndex = -1;
+                _namedEnemyIndex = -1;
+                _enemyByHpIndex = -1;
                 _lastCursorCoord = cursorCoord;
                 _cachedEnemies = null;
                 _cachedAllies = null;
                 _cachedUnacted = null;
                 _cachedActed = null;
+                _cachedNamedEnemies = null;
+                _cachedEnemyByHp = null;
             }
         }
 
@@ -330,6 +482,16 @@ namespace SRWYAccess
                 if (list[i].Pointer == ptr) return i;
             }
             return -1;
+        }
+
+        /// <summary>
+        /// Extract pilot name from combined "pilot / robot" format.
+        /// Returns the part before " / ", or the whole name if no separator.
+        /// </summary>
+        private static string ExtractPilotName(string name)
+        {
+            int idx = name.IndexOf(" / ", StringComparison.Ordinal);
+            return idx > 0 ? name.Substring(0, idx) : name;
         }
 
         /// <summary>
@@ -483,9 +645,11 @@ namespace SRWYAccess
                         string name = ReadPawnUnitName(pawn);
                         if (string.IsNullOrEmpty(name)) continue;
 
-                        // Read HP (protect PawnData with SafeCall)
+                        // Read HP and isCommonSoldier (protect PawnData with SafeCall)
                         int hpNow = 0, hpMax = 0;
                         bool hasHp = false;
+                        bool isCommon = false;
+                        bool isCommonKnown = false;
                         try
                         {
                             Pawn pawnData = null;
@@ -523,6 +687,24 @@ namespace SRWYAccess
                                         }
                                         catch { }
                                     }
+
+                                    // Read isCommonSoldier from pilot base data
+                                    try
+                                    {
+                                        var pilot = robot.MainPilot;
+                                        if ((object)pilot != null && pilot.Pointer != IntPtr.Zero
+                                            && SafeCall.ProbeObject(pilot.Pointer))
+                                        {
+                                            var baseData = pilot.BaseData;
+                                            if ((object)baseData != null
+                                                && SafeCall.ProbeObject(baseData.Pointer))
+                                            {
+                                                isCommon = baseData.isCommonSoldier;
+                                                isCommonKnown = true;
+                                            }
+                                        }
+                                    }
+                                    catch { }
                                 }
                             }
                         }
@@ -537,7 +719,9 @@ namespace SRWYAccess
                             Dy = dy,
                             HpNow = hpNow,
                             HpMax = hpMax,
-                            HasHp = hasHp
+                            HasHp = hasHp,
+                            IsCommonSoldier = isCommon,
+                            IsCommonSoldierKnown = isCommonKnown
                         });
                     }
                     catch { continue; }
@@ -838,8 +1022,123 @@ namespace SRWYAccess
                     return _lastUnactedPtr;
                 case LastListType.Acted:
                     return _lastActedPtr;
+                case LastListType.NamedEnemy:
+                    return _lastNamedEnemyPtr;
+                case LastListType.EnemyByHp:
+                    return _lastEnemyByHpPtr;
                 default:
                     return IntPtr.Zero;
+            }
+        }
+
+        /// <summary>
+        /// Announce direction and distance to event marker points on tactical grid.
+        /// Uses TacticalBoard.GetEventMarkerCoords() for destination markers,
+        /// and returns an announcement string with direction + distance from cursor.
+        /// Called on Alt+\ during TACTICAL_PART mode.
+        /// </summary>
+        public string GetMissionPointInfo(Vector2Int cursorCoord)
+        {
+            try
+            {
+                var mm = MapManager.Instance;
+                if ((object)mm == null || mm.Pointer == IntPtr.Zero)
+                {
+                    DebugHelper.Write("GetMissionPointInfo: MapManager null");
+                    return Loc.Get("mission_point_none");
+                }
+                if (!SafeCall.ProbeObject(mm.Pointer))
+                {
+                    DebugHelper.Write("GetMissionPointInfo: MapManager probe failed");
+                    return Loc.Get("mission_point_none");
+                }
+
+                TacticalBoard board;
+                try { board = mm.TacticalBoard; }
+                catch { return Loc.Get("mission_point_none"); }
+                if ((object)board == null || !SafeCall.ProbeObject(board.Pointer))
+                {
+                    DebugHelper.Write("GetMissionPointInfo: TacticalBoard null");
+                    return Loc.Get("mission_point_none");
+                }
+
+                var points = new List<(int dx, int dy, int dist)>();
+
+                // Get event marker coordinates (destination points on tactical grid)
+                Il2CppSystem.Collections.Generic.List<Vector2Int> eventCoords = null;
+                try { eventCoords = board.GetEventMarkerCoords(); }
+                catch (Exception ex) { DebugHelper.Write($"GetEventMarkerCoords error: {ex.Message}"); }
+
+                if ((object)eventCoords != null)
+                {
+                    int count = 0;
+                    try { count = eventCoords.Count; } catch { }
+                    DebugHelper.Write($"GetMissionPointInfo: eventMarkers={count}");
+                    for (int i = 0; i < count; i++)
+                    {
+                        try
+                        {
+                            var pos = eventCoords[i];
+                            int dx = pos.x - cursorCoord.x;
+                            int dy = pos.y - cursorCoord.y;
+                            int dist = Math.Abs(dx) + Math.Abs(dy);
+                            points.Add((dx, dy, dist));
+                        }
+                        catch { continue; }
+                    }
+                }
+
+                // Also check highlight area EventMarker coords as fallback
+                if (points.Count == 0)
+                {
+                    Il2CppSystem.Collections.Generic.List<Vector2Int> highlightCoords = null;
+                    try { highlightCoords = board.GetCoordsOfHighlightArea(TacticalBoard.HighlightType.EventMarker); }
+                    catch { }
+
+                    if ((object)highlightCoords != null)
+                    {
+                        int count = 0;
+                        try { count = highlightCoords.Count; } catch { }
+                        DebugHelper.Write($"GetMissionPointInfo: highlightEventMarkers={count}");
+                        for (int i = 0; i < count; i++)
+                        {
+                            try
+                            {
+                                var pos = highlightCoords[i];
+                                int dx = pos.x - cursorCoord.x;
+                                int dy = pos.y - cursorCoord.y;
+                                int dist = Math.Abs(dx) + Math.Abs(dy);
+                                points.Add((dx, dy, dist));
+                            }
+                            catch { continue; }
+                        }
+                    }
+                }
+
+                if (points.Count == 0)
+                {
+                    DebugHelper.Write("GetMissionPointInfo: no markers found");
+                    return Loc.Get("mission_point_none");
+                }
+
+                // Sort by distance (nearest first)
+                points.Sort((a, b) => a.dist.CompareTo(b.dist));
+
+                var parts = new List<string>();
+                for (int i = 0; i < points.Count; i++)
+                {
+                    var p = points[i];
+                    string dir = GetDirection(p.dx, p.dy);
+                    string path = BuildDetailedPath(p.dx, p.dy);
+                    parts.Add(Loc.Get("mission_point_info", i + 1, points.Count, dir, p.dist, path));
+                }
+
+                return string.Join("; ", parts);
+            }
+            catch (Exception ex)
+            {
+                DebugHelper.Write($"GetMissionPointInfo error: {ex.GetType().Name}: {ex.Message}");
+                return Loc.Get("mission_point_none");
             }
         }
 
