@@ -2,7 +2,7 @@
 SRWYAccess - Super Robot Wars Y Accessibility Mod
 ========================================
 
-Version: 2.3.5
+Version: 2.4
 Game: Super Robot Wars Y
 Supported Languages: English, Simplified Chinese, Traditional Chinese, Japanese, Korean
 
@@ -225,6 +225,10 @@ Alt + Backslash: Announce mission destination point direction/distance
   - Useful for missions that require moving units to specific locations
   - Sorted by nearest destination first
 
+Ctrl + Backslash: Announce enemy closest to mission destination point
+  - Shows the enemy unit nearest to any mission objective
+  - Announces enemy name, distance to point, direction/distance from cursor, HP
+
 --- Distance General ---
 \ (Backslash): Repeat last distance announcement
   - Re-announces the last unit you looked at
@@ -399,6 +403,7 @@ Ctrl+/: Next acted
 
 \: Repeat last
 Alt+\: Mission destination
+Ctrl+\: Enemy nearest to dest
 P: Path prediction
 
 =: Movement range

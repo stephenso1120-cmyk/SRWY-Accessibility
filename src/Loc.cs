@@ -2516,6 +2516,25 @@ namespace SRWYAccess
                 "目標 {0}/{1}：{2} 距離 {3}、{4}",
                 "목표 {0}/{1}: {2} 거리 {3}, {4}");
 
+            // ===== ENEMY NEAREST TO MISSION POINT (Ctrl+\) =====
+            // {0}=name, {1}=dist to point, {2}=dir from cursor, {3}=dist from cursor,
+            // {4}=hpNow, {5}=hpMax, {6}=point index, {7}=total points
+            Add("enemy_near_dest",
+                "Nearest to dest {6}/{7}: {0}, {1} from point, {2} distance {3}, HP {4}/{5}",
+                "最接近目标 {6}/{7}：{0}，距目标 {1}，{2} 距离 {3}，HP {4}/{5}",
+                "最接近目標 {6}/{7}：{0}，距目標 {1}，{2} 距離 {3}，HP {4}/{5}",
+                "目標{6}/{7}に最も近い敵：{0}、目標まで{1}、{2} 距離{3}、HP {4}/{5}",
+                "목표 {6}/{7}에 가장 가까운 적: {0}, 목표까지 {1}, {2} 거리 {3}, HP {4}/{5}");
+
+            // {0}=name, {1}=dist to point, {2}=dir from cursor, {3}=dist from cursor,
+            // {4}=point index, {5}=total points
+            Add("enemy_near_dest_simple",
+                "Nearest to dest {4}/{5}: {0}, {1} from point, {2} distance {3}",
+                "最接近目标 {4}/{5}：{0}，距目标 {1}，{2} 距离 {3}",
+                "最接近目標 {4}/{5}：{0}，距目標 {1}，{2} 距離 {3}",
+                "目標{4}/{5}に最も近い敵：{0}、目標まで{1}、{2} 距離{3}",
+                "목표 {4}/{5}에 가장 가까운 적: {0}, 목표까지 {1}, {2} 거리 {3}");
+
             // EButtonIndex stat names (order: HP=0, EN=1, AR=2, MO=3, SI=4, WP=5)
             Add("custom_stat_hp", "HP", "HP", "HP", "HP", "HP");
             Add("custom_stat_en", "EN", "EN", "EN", "EN", "EN");

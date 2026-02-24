@@ -21,7 +21,7 @@ namespace SRWYAccess
     /// </summary>
     public class UnitDistanceHandler
     {
-        private enum LastListType { Enemy, Ally, Unacted, Acted, NamedEnemy, EnemyByHp }
+        private enum LastListType { Enemy, Ally, Unacted, Acted, NamedEnemy, EnemyByHp, MissionNearest }
 
         private int _enemyIndex = -1;
         private int _allyIndex = -1;
@@ -53,6 +53,7 @@ namespace SRWYAccess
         private IntPtr _lastActedPtr = IntPtr.Zero;
         private IntPtr _lastNamedEnemyPtr = IntPtr.Zero;
         private IntPtr _lastEnemyByHpPtr = IntPtr.Zero;
+        private IntPtr _lastMissionNearestPtr = IntPtr.Zero;
 
         private struct UnitInfo
         {
@@ -96,6 +97,7 @@ namespace SRWYAccess
             _lastActedPtr = IntPtr.Zero;
             _lastNamedEnemyPtr = IntPtr.Zero;
             _lastEnemyByHpPtr = IntPtr.Zero;
+            _lastMissionNearestPtr = IntPtr.Zero;
         }
 
         /// <summary>
@@ -414,6 +416,10 @@ namespace SRWYAccess
                         },
                         "dist_no_enemies",
                         (u, i, t) => FormatAnnouncement(u, i, t, isEnemy: true));
+
+                case LastListType.MissionNearest:
+                    // Re-run mission nearest search for current cursor position
+                    return GetEnemyNearestToMissionPoint(cursorCoord);
 
                 default:
                     return Loc.Get("dist_no_enemies");
@@ -1026,6 +1032,8 @@ namespace SRWYAccess
                     return _lastNamedEnemyPtr;
                 case LastListType.EnemyByHp:
                     return _lastEnemyByHpPtr;
+                case LastListType.MissionNearest:
+                    return _lastMissionNearestPtr;
                 default:
                     return IntPtr.Zero;
             }
@@ -1138,6 +1146,139 @@ namespace SRWYAccess
             catch (Exception ex)
             {
                 DebugHelper.Write($"GetMissionPointInfo error: {ex.GetType().Name}: {ex.Message}");
+                return Loc.Get("mission_point_none");
+            }
+        }
+
+        /// <summary>
+        /// Find the enemy unit closest to any mission destination point.
+        /// Returns announcement with enemy name, distance to nearest point,
+        /// and direction from that point.
+        /// Called on Ctrl+\ during TACTICAL_PART mode.
+        /// </summary>
+        public string GetEnemyNearestToMissionPoint(Vector2Int cursorCoord)
+        {
+            try
+            {
+                var mm = MapManager.Instance;
+                if ((object)mm == null || mm.Pointer == IntPtr.Zero)
+                    return Loc.Get("mission_point_none");
+                if (!SafeCall.ProbeObject(mm.Pointer))
+                    return Loc.Get("mission_point_none");
+
+                TacticalBoard board;
+                try { board = mm.TacticalBoard; }
+                catch { return Loc.Get("mission_point_none"); }
+                if ((object)board == null || !SafeCall.ProbeObject(board.Pointer))
+                    return Loc.Get("mission_point_none");
+
+                // Collect mission destination points
+                var missionPoints = new List<Vector2Int>();
+
+                Il2CppSystem.Collections.Generic.List<Vector2Int> eventCoords = null;
+                try { eventCoords = board.GetEventMarkerCoords(); }
+                catch { }
+
+                if ((object)eventCoords != null)
+                {
+                    int count = 0;
+                    try { count = eventCoords.Count; } catch { }
+                    for (int i = 0; i < count; i++)
+                    {
+                        try { missionPoints.Add(eventCoords[i]); }
+                        catch { }
+                    }
+                }
+
+                // Fallback: highlight area EventMarker
+                if (missionPoints.Count == 0)
+                {
+                    Il2CppSystem.Collections.Generic.List<Vector2Int> highlightCoords = null;
+                    try { highlightCoords = board.GetCoordsOfHighlightArea(TacticalBoard.HighlightType.EventMarker); }
+                    catch { }
+
+                    if ((object)highlightCoords != null)
+                    {
+                        int count = 0;
+                        try { count = highlightCoords.Count; } catch { }
+                        for (int i = 0; i < count; i++)
+                        {
+                            try { missionPoints.Add(highlightCoords[i]); }
+                            catch { }
+                        }
+                    }
+                }
+
+                if (missionPoints.Count == 0)
+                    return Loc.Get("mission_point_none");
+
+                // Build enemy list (sorted by distance from cursor, but we'll re-sort)
+                var enemies = BuildUnitList(cursorCoord, isEnemy: true);
+                if (enemies == null || enemies.Count == 0)
+                    return Loc.Get("dist_no_enemies");
+
+                // For each enemy, find minimum distance to any mission point
+                string closestName = null;
+                int closestDist = int.MaxValue;
+                int closestDx = 0, closestDy = 0;
+                int closestPointIdx = 0;
+                int closestHpNow = 0, closestHpMax = 0;
+                bool closestHasHp = false;
+                int closestEnemyUx = 0, closestEnemyUy = 0;
+                IntPtr closestPtr = IntPtr.Zero;
+
+                foreach (var enemy in enemies)
+                {
+                    // Enemy position: cursorCoord + (dx, dy) = enemy position
+                    int ex = cursorCoord.x + enemy.Dx;
+                    int ey = cursorCoord.y + enemy.Dy;
+
+                    for (int pi = 0; pi < missionPoints.Count; pi++)
+                    {
+                        var mp = missionPoints[pi];
+                        int dist = Math.Abs(ex - mp.x) + Math.Abs(ey - mp.y);
+                        if (dist < closestDist)
+                        {
+                            closestDist = dist;
+                            closestName = enemy.Name;
+                            closestDx = ex - mp.x; // direction FROM mission point TO enemy
+                            closestDy = ey - mp.y;
+                            closestPointIdx = pi;
+                            closestHpNow = enemy.HpNow;
+                            closestHpMax = enemy.HpMax;
+                            closestHasHp = enemy.HasHp;
+                            closestEnemyUx = ex;
+                            closestEnemyUy = ey;
+                            closestPtr = enemy.Pointer;
+                        }
+                    }
+                }
+
+                if (closestName == null)
+                    return Loc.Get("dist_no_enemies");
+
+                // Save pointer so P key can get path to this enemy
+                _lastMissionNearestPtr = closestPtr;
+                _lastList = LastListType.MissionNearest;
+
+                // Direction from cursor to the enemy
+                int curDx = closestEnemyUx - cursorCoord.x;
+                int curDy = closestEnemyUy - cursorCoord.y;
+                int curDist = Math.Abs(curDx) + Math.Abs(curDy);
+                string curDir = GetDirection(curDx, curDy);
+
+                if (closestHasHp)
+                    return Loc.Get("enemy_near_dest", closestName, closestDist,
+                        curDir, curDist, closestHpNow, closestHpMax,
+                        closestPointIdx + 1, missionPoints.Count);
+                else
+                    return Loc.Get("enemy_near_dest_simple", closestName, closestDist,
+                        curDir, curDist,
+                        closestPointIdx + 1, missionPoints.Count);
+            }
+            catch (Exception ex)
+            {
+                DebugHelper.Write($"GetEnemyNearestToMissionPoint error: {ex.GetType().Name}: {ex.Message}");
                 return Loc.Get("mission_point_none");
             }
         }

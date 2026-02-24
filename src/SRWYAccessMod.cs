@@ -1667,7 +1667,16 @@ namespace SRWYAccess
 
             if (keyBackslash && !_lastKeyBackslash)
             {
-                if (altHeld)
+                if (ctrlHeld)
+                {
+                    // Ctrl+\: announce enemy closest to mission destination point
+                    DebugHelper.Write($"Ctrl+\\ pressed at cursor ({cursorCoord.x},{cursorCoord.y})");
+                    string msg = _unitDistanceHandler.GetEnemyNearestToMissionPoint(cursorCoord);
+                    DebugHelper.Write($"Ctrl+\\ result: {msg}");
+                    if (!string.IsNullOrEmpty(msg))
+                        ScreenReaderOutput.Say(msg);
+                }
+                else if (altHeld)
                 {
                     // Alt+\: announce mission destination point direction/distance
                     DebugHelper.Write($"Alt+\\ pressed at cursor ({cursorCoord.x},{cursorCoord.y})");

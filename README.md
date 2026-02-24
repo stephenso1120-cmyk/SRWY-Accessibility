@@ -1,6 +1,6 @@
 # SRWYAccess - Super Robot Wars Y Accessibility Mod
 
-Version: 2.3.5
+Version: 2.4
 Game: Super Robot Wars Y (Steam)
 Supported Languages: English, Simplified Chinese, Traditional Chinese, Japanese, Korean
 
@@ -93,6 +93,7 @@ Place files from the release archive:
 ### Tactical Map: Mission Destination
 
 - Alt+\: Announce direction and distance to mission destination points
+- Ctrl+\: Announce the enemy closest to mission destination point
 
 ### Tactical Map: Other
 
@@ -150,6 +151,10 @@ Place files from the release archive:
 - Mod pauses when the game window is not focused (Alt-Tab safe)
 
 ## Changelog
+
+### v2.4 (2026-02-25)
+
+- New: Ctrl+\ announces the enemy unit closest to mission destination point (name, distance to point, direction/distance from cursor, HP)
 
 ### v2.3.5 (2026-02-24)
 
