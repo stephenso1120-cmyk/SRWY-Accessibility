@@ -2,7 +2,7 @@
 SRWYAccess - Super Robot Wars Y Accessibility Mod
 ========================================
 
-Version: 2.45
+Version: 2.5
 Game: Super Robot Wars Y
 Supported Languages: English, Simplified Chinese, Traditional Chinese, Japanese, Korean
 

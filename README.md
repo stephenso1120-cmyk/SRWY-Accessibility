@@ -1,6 +1,6 @@
 # SRWYAccess - Super Robot Wars Y Accessibility Mod
 
-Version: 2.45
+Version: 2.5
 Game: Super Robot Wars Y (Steam)
 Supported Languages: English, Simplified Chinese, Traditional Chinese, Japanese, Korean
 
@@ -117,6 +117,7 @@ Place files from the release archive:
 - System settings: reads setting description and current value, announces changes on left/right
 - Parts equip: reads slot name and equipped part (or "Equipable" if empty), with part description
 - Parts equip / Pilot training: announces unit/pilot name on Q/E switch
+- Tactical command menus: announces unit name when switching units with Q/E
 
 ### Story Dialogue
 
@@ -155,6 +156,14 @@ Place files from the release archive:
 - Mod pauses when the game window is not focused (Alt-Tab safe)
 
 ## Changelog
+
+### v2.5 (2026-02-28)
+
+- New: Q/E unit switching in tactical command menus now announces the new unit name together with the menu item
+- Improved: All announcement timings optimized for faster response (~30-50% faster across all features)
+- Improved: Adventure→next scene transition ~930ms faster (subtitle reading starts sooner)
+- Improved: Guard mode and search cooldown now run concurrently, reducing transition delays
+- Improved: Adventure blackout reduced from ~1s to ~400ms with SEH protection
 
 ### v2.45 (2026-02-27)
 

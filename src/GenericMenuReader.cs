@@ -221,8 +221,37 @@ namespace SRWYAccess
         private string _lastSortText = "";
         private string _lastFilterText = "";
 
+        // Pending unit name announcement for tactical command menu.
+        // Set by SRWYAccessMod before TACTICAL→NONE release so unit name
+        // survives handler release and is announced when command menu opens.
+        private string _pendingUnitAnnouncement;
+
+        // Unit switch prefix: prepended to the next AnnounceItem call.
+        // Set when Q/E switches units while a command menu is open.
+        // Persists across frames until consumed by an announcement.
+        private string _unitSwitchPrefix;
+
         public bool HasHandler => (object)_activeHandler != null;
         public IntPtr CurrentHandlerPtr => _lastHandlerPtr;
+
+        /// <summary>
+        /// Set a unit name to announce when TacticallPartCommandUIHandler
+        /// is first detected in unit command mode (not map menu).
+        /// </summary>
+        public void SetPendingUnitAnnouncement(string name)
+        {
+            _pendingUnitAnnouncement = name;
+        }
+
+        /// <summary>
+        /// Set a unit name prefix to prepend to the next menu item announcement.
+        /// Used for Q/E unit switching while command menu is open.
+        /// Persists until consumed by AnnounceItem or new handler announcement.
+        /// </summary>
+        public void SetUnitSwitchPrefix(string name)
+        {
+            _unitSwitchPrefix = name;
+        }
 
         public void ReleaseHandler()
         {
@@ -572,6 +601,26 @@ namespace SRWYAccess
                 string screenName = Loc.Get(screenKey);
                 if (screenName != screenKey)
                     ScreenReaderOutput.Say(screenName);
+
+                // Announce unit name only for initial unit command menu (ShowCommandType.Unit=0),
+                // not for post-move (2), post-battle (3), or post-battle-after-move (4).
+                if (_pendingUnitAnnouncement != null)
+                {
+                    if (_activeHandlerType == "TacticallPartCommandUIHandler"
+                        && _lastCommandType == 0) // ShowCommandType.Unit only
+                    {
+                        ScreenReaderOutput.Say(_pendingUnitAnnouncement);
+                        DebugHelper.Write($"GenericMenu: unit command for: {_pendingUnitAnnouncement}");
+                    }
+                    _pendingUnitAnnouncement = null;
+                }
+                // Consume unit switch prefix on handler re-find (Q/E while menu open)
+                else if (_unitSwitchPrefix != null)
+                {
+                    ScreenReaderOutput.Say(_unitSwitchPrefix);
+                    DebugHelper.Write($"GenericMenu: unit switch on handler refind: {_unitSwitchPrefix}");
+                    _unitSwitchPrefix = null;
+                }
 
                 // If cursor starts at -1 for a type-specific handler, announce first item
                 if (currentIndex < 0 && _typeSpecificCount > 0)
@@ -1692,7 +1741,7 @@ namespace SRWYAccess
                         if (!string.IsNullOrWhiteSpace(text))
                         {
                             ScreenReaderOutput.Say(text);
-                            _descriptionDelay = 3;
+                            _descriptionDelay = 2;
                             _descriptionRetries = 0;
                             _descriptionCursorIndex = slotIndex;
                             DebugHelper.Write($"GenericMenu: [PartsEquip] slot={slotIndex} text={text}");
@@ -1721,7 +1770,7 @@ namespace SRWYAccess
                         if (!string.IsNullOrWhiteSpace(text))
                         {
                             ScreenReaderOutput.Say(text);
-                            _descriptionDelay = 3;
+                            _descriptionDelay = 2;
                             _descriptionRetries = 0;
                             DebugHelper.Write($"GenericMenu: [PartsEquip] list cursor={curIdx} text={text}");
                         }
@@ -2337,7 +2386,7 @@ namespace SRWYAccess
                 if (!string.IsNullOrWhiteSpace(text))
                 {
                     ScreenReaderOutput.Say(text);
-                    _descriptionDelay = 3;
+                    _descriptionDelay = 2;
                     _descriptionRetries = 0;
                     DebugHelper.Write($"GenericMenu: [PilotTraining] tab={menuType} cursor={cursor} text={text}");
                 }
@@ -3850,7 +3899,7 @@ namespace SRWYAccess
                         _activeHandlerType = typeName;
                         _typeSpecificCount = -1;
                         _newHandlerJustFound = true;
-                        _initSkipCount = 3; // let UI settle before reading
+                        _initSkipCount = 2; // let UI settle before reading
                         _cmdDiagDumped = false;
 
                         // Detect ListHandlerBase for menus
@@ -3973,6 +4022,16 @@ namespace SRWYAccess
                 text = ReadAllVisibleText();
             }
 
+            // Prepend unit switch prefix (Q/E unit cycling while menu open)
+            if (!string.IsNullOrEmpty(_unitSwitchPrefix))
+            {
+                if (!string.IsNullOrWhiteSpace(text))
+                    text = _unitSwitchPrefix + ", " + text;
+                else
+                    text = _unitSwitchPrefix;
+                _unitSwitchPrefix = null;
+            }
+
             if (!string.IsNullOrWhiteSpace(text))
             {
                 ScreenReaderOutput.Say(text);
@@ -3993,7 +4052,7 @@ namespace SRWYAccess
                 // Rapid navigation resets the timer, reading only the final item.
                 // Applied to ALL handlers: specific readers run first, then
                 // generic GuideUIHandler.m_GuideText as universal fallback.
-                _descriptionDelay = 3;
+                _descriptionDelay = 2;
                 _descriptionRetries = 0;
                 _descriptionCursorIndex = index;
             }

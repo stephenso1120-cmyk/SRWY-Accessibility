@@ -14,12 +14,11 @@ namespace SRWYAccess
     ///   - Announces page name when tab switches (Q/E or L1/R1)
     ///
     /// Architecture:
-    ///   OptionUIHandler.basePages[0..2] → PageOptionGame / PageOptionSound / PageOptionScreen
+    ///   OptionUIHandler.basePages → all pages (Game/Sound/Screen/KeyBind/BGM/Analysis)
     ///   Each page has columnCommons (ColumnCommons extends List&lt;ColumnCommon&gt;)
     ///   ColumnCommons.LightIndex() → which column is highlighted
-    ///   ColumnSelect: labelControl.meshLabel.textMesh = value TMP, textMesh = value TMP
-    ///   ColumnVolume: volValue = value TMP, label from TMP children
-    ///   ColumnString: nameText = label TMP, Name property = value string
+    ///   Column types: ColumnSelect, ColumnVolume, ColumnString, ColumnKeyBind,
+    ///                 ColumnMusic, ColumnBattleSound, ColumnPoint, ColumnButton
     /// </summary>
     public class SystemOptionHandler
     {
@@ -33,8 +32,17 @@ namespace SRWYAccess
         private string _lastDescription = "";
         private int _pendingAnnounceFrames; // defer announcement to let game update explanation text
 
-        // Localization keys for the 3 option pages
+        // Localization keys for the 3 main option pages (index 0-2)
         private static readonly string[] PageKeys = { "option_page_game", "option_page_sound", "option_page_screen" };
+
+        // Map gameObject name keywords to localization keys for sub-pages (index 3+)
+        private static readonly (string keyword, string locKey)[] SubPageMap =
+        {
+            ("KeyBind", "option_page_keybind"),
+            ("KeyGuide", "option_page_help"),
+            ("BGM", "option_page_bgm"),
+            ("Analysis", "option_page_analysis"),
+        };
 
         public bool HasHandler => (object)_handler != null;
 
@@ -120,12 +128,11 @@ namespace SRWYAccess
             try { pageCount = basePages.Count; }
             catch { return; }
 
-            // Find active page (only first 3: Game=0, Sound=1, Screen=2)
+            // Find active page (check all pages: Game/Sound/Screen/KeyBind/BGM/Analysis)
             int activePageIndex = -1;
             PageCommon activePage = null;
 
-            int checkCount = Math.Min(pageCount, 3);
-            for (int i = 0; i < checkCount; i++)
+            for (int i = 0; i < pageCount; i++)
             {
                 PageCommon page;
                 try { page = basePages[i]; }
@@ -156,15 +163,20 @@ namespace SRWYAccess
                 _lastDescription = "";
                 _explanationTmpPtr = IntPtr.Zero;
 
-                string pageKey = activePageIndex < PageKeys.Length ? PageKeys[activePageIndex] : "option_page_game";
-                ScreenReaderOutput.Say(Loc.Get(pageKey));
+                string pageName = GetPageName(activePageIndex, activePage);
+                if (!string.IsNullOrEmpty(pageName))
+                    ScreenReaderOutput.Say(pageName);
                 DebugHelper.Write($"SystemOption: page={activePageIndex}");
             }
 
             // Get columnCommons for cursor tracking
             var colCommons = activePage.columnCommons;
-            if ((object)colCommons == null) return;
-            if (!SafeCall.ProbeObject(colCommons.Pointer)) return;
+            if ((object)colCommons == null || !SafeCall.ProbeObject(colCommons.Pointer))
+            {
+                // BGM pages use different column controllers instead of columnCommons
+                ReadBgmPageState(activePage);
+                return;
+            }
 
             int lightIndex;
             try { lightIndex = colCommons.LightIndex(); }
@@ -316,6 +328,37 @@ namespace SRWYAccess
         }
 
         /// <summary>
+        /// Get the display name for a page by index. Uses localization keys for known pages
+        /// and falls back to gameObject name matching for sub-pages.
+        /// </summary>
+        private string GetPageName(int pageIndex, PageCommon page)
+        {
+            // Known main pages (0-2)
+            if (pageIndex < PageKeys.Length)
+                return Loc.Get(PageKeys[pageIndex]);
+
+            // Sub-pages: detect from gameObject name
+            try
+            {
+                var go = page.gameObject;
+                if ((object)go == null) return null;
+
+                string goName = go.name;
+                if (string.IsNullOrEmpty(goName)) return null;
+
+                foreach (var (keyword, locKey) in SubPageMap)
+                {
+                    if (goName.Contains(keyword))
+                        return Loc.Get(locKey);
+                }
+
+                // Unknown page: use gameObject name as-is
+                return goName;
+            }
+            catch { return null; }
+        }
+
+        /// <summary>
         /// Read just the current value from a column using type-specific fields.
         /// </summary>
         private string ReadColumnValue(ColumnCommon col)
@@ -358,6 +401,62 @@ namespace SRWYAccess
                     catch { return null; }
                 }
 
+                // ColumnKeyBind → actionItem + assignName
+                var colKeyBind = col.TryCast<ColumnKeyBind>();
+                if ((object)colKeyBind != null)
+                {
+                    string action = null, key = null;
+                    var ai = colKeyBind.actionItem;
+                    if ((object)ai != null)
+                        action = ReadTmpText(ai);
+                    var an = colKeyBind.assignName;
+                    if ((object)an != null)
+                        key = ReadTmpText(an);
+                    return FormatLabelValue(action, key);
+                }
+
+                // ColumnMusic → mesh
+                var colMusic = col.TryCast<ColumnMusic>();
+                if ((object)colMusic != null)
+                {
+                    var m = colMusic.mesh;
+                    if ((object)m != null)
+                    {
+                        string val = ReadTmpText(m);
+                        if (!string.IsNullOrWhiteSpace(val))
+                            return val;
+                    }
+                    return null;
+                }
+
+                // ColumnBattleSound → robotName + bgmName
+                var colBS = col.TryCast<ColumnBattleSound>();
+                if ((object)colBS != null)
+                {
+                    string robot = null, bgm = null;
+                    var rn = colBS.robotName;
+                    if ((object)rn != null)
+                        robot = ReadTmpText(rn);
+                    var bn = colBS.bgmName;
+                    if ((object)bn != null)
+                        bgm = ReadTmpText(bn);
+                    return FormatLabelValue(robot, bgm);
+                }
+
+                // ColumnPoint → title + startSelect
+                var colPoint = col.TryCast<ColumnPoint>();
+                if ((object)colPoint != null)
+                {
+                    string title = null, start = null;
+                    var t = colPoint.title;
+                    if ((object)t != null)
+                        title = ReadTmpText(t);
+                    var ss = colPoint.startSelect;
+                    if ((object)ss != null)
+                        start = ReadTmpText(ss);
+                    return FormatLabelValue(title, start);
+                }
+
                 // Fallback: last non-empty TMP child
                 var go = col.gameObject;
                 if ((object)go == null) return null;
@@ -374,6 +473,174 @@ namespace SRWYAccess
                 return null;
             }
             catch { return null; }
+        }
+
+        /// <summary>
+        /// Handle cursor tracking for BGM sub-pages where columnCommons is null.
+        /// BGM pages use ColumnsControl&lt;T&gt; or ColumnControl instead.
+        /// </summary>
+        private void ReadBgmPageState(PageCommon activePage)
+        {
+            try
+            {
+                // PageBGM01: ColumnsControl<ColumnBattleSound>
+                var bgm01 = activePage.TryCast<PageBGM01>();
+                if ((object)bgm01 != null)
+                {
+                    ReadBgmBattleSound(bgm01.columnsControl);
+                    return;
+                }
+
+                // PageBGM02: ColumnsControl<ColumnBattleSound>
+                var bgm02 = activePage.TryCast<PageBGM02>();
+                if ((object)bgm02 != null)
+                {
+                    ReadBgmBattleSound(bgm02.columnsControl);
+                    return;
+                }
+
+                // PageBGM03: ColumnsControl<ColumnSound>
+                var bgm03 = activePage.TryCast<PageBGM03>();
+                if ((object)bgm03 != null)
+                {
+                    ReadBgmSound(bgm03.columnsControl);
+                    return;
+                }
+
+                // PageBGM05: ColumnControl → ColumnPoint
+                var bgm05 = activePage.TryCast<PageBGM05>();
+                if ((object)bgm05 != null)
+                {
+                    ReadBgm05(bgm05.columnControl);
+                    return;
+                }
+
+                // PageBGM04 (album browser): no cursor tracking available
+            }
+            catch (Exception ex)
+            {
+                DebugHelper.Write($"SystemOption: BGM error: {ex.GetType().Name}: {ex.Message}");
+            }
+        }
+
+        private void ReadBgmBattleSound(ColumnsControl<ColumnBattleSound> ctrl)
+        {
+            if ((object)ctrl == null) return;
+            if (!SafeCall.ProbeObject(ctrl.Pointer)) return;
+
+            int lightIndex;
+            try { lightIndex = ctrl.LightIndex(); }
+            catch { return; }
+            if (lightIndex < 0) return;
+
+            ColumnBattleSound col;
+            try { col = ctrl.LightedColumn(); }
+            catch { return; }
+            if ((object)col == null) return;
+            if (!SafeCall.ProbeObject(col.Pointer)) return;
+
+            string robot = null, bgm = null;
+            var rn = col.robotName;
+            if ((object)rn != null) robot = ReadTmpText(rn);
+            var bn = col.bgmName;
+            if ((object)bn != null) bgm = ReadTmpText(bn);
+
+            AnnounceIfChanged(lightIndex, FormatLabelValue(robot, bgm));
+        }
+
+        private void ReadBgmSound(ColumnsControl<ColumnSound> ctrl)
+        {
+            if ((object)ctrl == null) return;
+            if (!SafeCall.ProbeObject(ctrl.Pointer)) return;
+
+            int lightIndex;
+            try { lightIndex = ctrl.LightIndex(); }
+            catch { return; }
+            if (lightIndex < 0) return;
+
+            ColumnSound col;
+            try { col = ctrl.LightedColumn(); }
+            catch { return; }
+            if ((object)col == null) return;
+            if (!SafeCall.ProbeObject(col.Pointer)) return;
+
+            // ColumnSound has meshes (List<TextMeshProUGUI>)
+            string text = null;
+            var meshes = col.meshes;
+            if ((object)meshes != null)
+            {
+                int count;
+                try { count = meshes.Count; }
+                catch { count = 0; }
+                for (int i = 0; i < count; i++)
+                {
+                    TextMeshProUGUI tmp;
+                    try { tmp = meshes[i]; }
+                    catch { continue; }
+                    if ((object)tmp == null) continue;
+                    string t = ReadTmpText(tmp);
+                    if (!string.IsNullOrWhiteSpace(t))
+                        text = (text == null) ? t : text + ", " + t;
+                }
+            }
+
+            AnnounceIfChanged(lightIndex, text);
+        }
+
+        private void ReadBgm05(ColumnControl ctrl)
+        {
+            if ((object)ctrl == null) return;
+            if (!SafeCall.ProbeObject(ctrl.Pointer)) return;
+
+            ColumnPoint col;
+            try { col = ctrl.LightedColumn(); }
+            catch { return; }
+            if ((object)col == null) return;
+            if (!SafeCall.ProbeObject(col.Pointer)) return;
+
+            string title = null, start = null;
+            var t = col.title;
+            if ((object)t != null) title = ReadTmpText(t);
+            var ss = col.startSelect;
+            if ((object)ss != null) start = ReadTmpText(ss);
+
+            // ColumnControl lacks LightIndex, track by value change only
+            string value = FormatLabelValue(title, start);
+            if ((value ?? "") != _lastValue)
+            {
+                _lastValue = value ?? "";
+                if (!string.IsNullOrEmpty(value))
+                {
+                    ScreenReaderOutput.Say(value);
+                    DebugHelper.Write($"SystemOption: BGM05 {value}");
+                }
+            }
+        }
+
+        /// <summary>
+        /// Announce if cursor position or value changed (used by BGM pages).
+        /// </summary>
+        private void AnnounceIfChanged(int lightIndex, string value)
+        {
+            if (lightIndex != _lastLightIndex)
+            {
+                _lastLightIndex = lightIndex;
+                _lastValue = value ?? "";
+                if (!string.IsNullOrEmpty(value))
+                {
+                    ScreenReaderOutput.Say(value);
+                    DebugHelper.Write($"SystemOption: BGM [{lightIndex}] {value}");
+                }
+            }
+            else if ((value ?? "") != _lastValue)
+            {
+                _lastValue = value ?? "";
+                if (!string.IsNullOrEmpty(value))
+                {
+                    ScreenReaderOutput.Say(value);
+                    DebugHelper.Write($"SystemOption: BGM val [{lightIndex}] {value}");
+                }
+            }
         }
 
         private string ReadTmpText(TextMeshProUGUI tmp)

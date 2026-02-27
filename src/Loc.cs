@@ -736,6 +736,34 @@ namespace SRWYAccess
                 "画面設定",
                 "화면 설정");
 
+            Add("option_page_keybind",
+                "Key Bindings",
+                "按键设定",
+                "按鍵設定",
+                "キーバインド",
+                "키 설정");
+
+            Add("option_page_help",
+                "Key Guide",
+                "按键说明",
+                "按鍵說明",
+                "キーガイド",
+                "키 가이드");
+
+            Add("option_page_bgm",
+                "BGM Settings",
+                "BGM设定",
+                "BGM設定",
+                "BGM設定",
+                "BGM 설정");
+
+            Add("option_page_analysis",
+                "Analysis",
+                "分析",
+                "分析",
+                "分析",
+                "분석");
+
             // ===== GAME OVER =====
             Add("state_game_over",
                 "Game Over",

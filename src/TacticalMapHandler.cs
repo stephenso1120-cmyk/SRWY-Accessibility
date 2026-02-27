@@ -28,6 +28,9 @@ namespace SRWYAccess
         private IntPtr _lastPawnPtr = IntPtr.Zero;
         private bool _cursorFound;
 
+        // Pending unit switch name: set on detection, consumed by main loop
+        private string _pendingUnitSwitch;
+
         // Movement remaining tracking: announce remaining steps on every cursor move
         private int _lastMoveRemaining = -1;
 
@@ -214,6 +217,27 @@ namespace SRWYAccess
         }
 
         /// <summary>
+        /// Detect unit switch without announcing. Stores pending name for
+        /// the main loop to combine with GenericMenuReader announcements.
+        /// Used in NONE+postTactical mode where Q/E switches units while
+        /// a command menu is open.
+        /// </summary>
+        public void UpdateUnitOnlySilent()
+        {
+            CheckUnitChange(announce: false);
+        }
+
+        /// <summary>
+        /// Return and clear pending unit switch name.
+        /// </summary>
+        public string ConsumePendingUnitSwitch()
+        {
+            var name = _pendingUnitSwitch;
+            _pendingUnitSwitch = null;
+            return name;
+        }
+
+        /// <summary>
         /// Get fresh FloatingCursor from MapManager (static singleton chain, safe).
         /// NEVER cache this ref - use it within a single poll cycle only.
         ///
@@ -260,8 +284,9 @@ namespace SRWYAccess
         /// Detect unit cycling (Q/E for allies, 1/3 for enemies, attack target selection).
         /// Uses PawnController.SelectedPawnInfo from MapManager (static singleton chain,
         /// no FindObjectOfType needed).
+        /// When announce=false, stores name in _pendingUnitSwitch for external consumption.
         /// </summary>
-        private void CheckUnitChange()
+        private void CheckUnitChange(bool announce = true)
         {
             IntPtr currentPawnPtr = IntPtr.Zero;
             try
@@ -294,6 +319,7 @@ namespace SRWYAccess
             }
 
             if (currentPawnPtr == _lastPawnPtr) return;
+            IntPtr previousPawnPtr = _lastPawnPtr;
             _lastPawnPtr = currentPawnPtr;
 
             if (currentPawnPtr == IntPtr.Zero)
@@ -307,8 +333,15 @@ namespace SRWYAccess
             if (!string.IsNullOrEmpty(unitName))
             {
                 _lastUnitInfo = unitName;
-                ScreenReaderOutput.Say(unitName);
-                DebugHelper.Write($"TacticalMap: Unit changed: {unitName}");
+                // Only mark as pending Q/E switch when going from one unit to another
+                // (non-zero → non-zero). Skip when _lastPawnPtr was zero (initial
+                // detection after ReleaseHandler reset) to avoid false positives
+                // that would throttle the post-move standby menu announcement.
+                if (previousPawnPtr != IntPtr.Zero)
+                    _pendingUnitSwitch = unitName;
+                if (announce)
+                    ScreenReaderOutput.Say(unitName);
+                DebugHelper.Write($"TacticalMap: Unit changed: {unitName} (announce={announce}, wasSwitch={previousPawnPtr != IntPtr.Zero})");
             }
         }
 

@@ -89,16 +89,16 @@ namespace SRWYAccess
         public const int MenuStalePollLimit = 75;
 
         /// <summary>Probe interval when in stale mode (every Nth cycle).</summary>
-        public const int MenuStaleProbeInterval = 5;
+        public const int MenuStaleProbeInterval = 3;
 
         /// <summary>Mode change re-announcement cooldown cycles.</summary>
-        public const int MenuModeChangeCooldown = 10;
+        public const int MenuModeChangeCooldown = 5;
 
         /// <summary>Battle warmup: skip ALL handler code for first N poll cycles after
         /// entering BATTLE_SCENE. Provides minimal buffer for scene objects to load.
         /// Keep short - VEH protection + danger zone (polls 10-20) handle safety.
-        /// 5 polls × ~67ms = ~330ms of silence.</summary>
-        public const int BattleWarmupPolls = 5;
+        /// 3 polls × ~67ms = ~200ms of silence.</summary>
+        public const int BattleWarmupPolls = 3;
 
         // ===== BattleSubtitleHandler =====
 
@@ -106,7 +106,7 @@ namespace SRWYAccess
         public const int BattleStaleLimit = 2;
 
         /// <summary>Probe interval when in stale mode.</summary>
-        public const int BattleStaleProbeInterval = 5;
+        public const int BattleStaleProbeInterval = 3;
 
         /// <summary>Max retries for GetComponentsInChildren name reads.</summary>
         public const int BattleNamesMaxRetries = 3;
@@ -117,7 +117,7 @@ namespace SRWYAccess
         public const int AdvStaleTextLimit = 45;
 
         /// <summary>Probe interval when in stale text mode.</summary>
-        public const int AdvStaleProbeInterval = 5;
+        public const int AdvStaleProbeInterval = 3;
 
         /// <summary>Search cooldown cycles after dialogue refs released (~1.5s).</summary>
         public const int AdvSearchCooldown = 23;
@@ -131,15 +131,15 @@ namespace SRWYAccess
         // ===== DialogHandler =====
 
         /// <summary>Re-read attempt interval (every Nth cycle).</summary>
-        public const int DialogRereadInterval = 3;
+        public const int DialogRereadInterval = 2;
 
         /// <summary>Max re-read attempts before announcing as-is.</summary>
-        public const int DialogRereadMaxAttempts = 15;
+        public const int DialogRereadMaxAttempts = 8;
 
         // ===== ScreenReaderOutput =====
 
         /// <summary>Deduplication window in milliseconds.</summary>
-        public const int DedupWindowMs = 300;
+        public const int DedupWindowMs = 150;
 
         // ===== DebugHelper =====
 
@@ -180,25 +180,33 @@ namespace SRWYAccess
 
         /// <summary>Transition blackout for tactical→NONE (frames). Shorter than
         /// adventure/battle because tactical command menus are lightweight UI overlays.
-        /// 10 frames ≈ 167ms at 60fps.</summary>
-        public const int TacticalBlackoutFrames = 10;
+        /// 6 frames ≈ 100ms at 60fps.</summary>
+        public const int TacticalBlackoutFrames = 6;
 
-        /// <summary>Effective GuardWarmupCycles. Reduced from 8 to 3 when SEH available.</summary>
+        /// <summary>Transition blackout for adventure→NONE (frames). Heavy scene
+        /// transitions (full scene destroy + load). 60 frames ≈ 1s at 60fps.
+        /// With SEH, reduced because VEH catches any AV during the transition.</summary>
+        public const int AdventureBlackoutFrames = 60;
+
+        /// <summary>Effective AdventureBlackoutFrames. Reduced from 60 to 24 when SEH available (~400ms).</summary>
+        public static int AdventureBlackoutFramesEffective = AdventureBlackoutFrames;
+
+        /// <summary>Effective GuardWarmupCycles. Reduced from 8 to 2 when SEH available.</summary>
         public static int GuardWarmupCyclesEffective = GuardWarmupCycles;
 
-        /// <summary>Effective NoneProbeThreshold. Reduced from 55 to 15 when SEH available.</summary>
+        /// <summary>Effective NoneProbeThreshold. Reduced from 55 to 12 when SEH available.</summary>
         public static int NoneProbeThresholdEffective = NoneProbeThreshold;
 
-        /// <summary>Effective GuardStabilityThreshold. Reduced from 15 to 5 when SEH available.</summary>
+        /// <summary>Effective GuardStabilityThreshold. Reduced from 15 to 3 when SEH available.</summary>
         public static int GuardStabilityThresholdEffective = GuardStabilityThreshold;
 
         /// <summary>Effective GuardMaxCycles. Reduced from 900 to 150 when SEH available.</summary>
         public static int GuardMaxCyclesEffective = GuardMaxCycles;
 
-        /// <summary>Effective SearchCooldownAfterChange. Reduced from 3 to 2 when SEH available.</summary>
+        /// <summary>Effective SearchCooldownAfterChange. Reduced from 3 to 1 when SEH available.</summary>
         public static int SearchCooldownEffective = SearchCooldownAfterChange;
 
-        /// <summary>Effective TacticalTransitionCooldown. Reduced from 8 to 6 when SEH available.</summary>
+        /// <summary>Effective TacticalTransitionCooldown. Reduced from 8 to 4 when SEH available.</summary>
         public static int TacticalTransitionCooldownEffective = TacticalTransitionCooldown;
 
         /// <summary>Effective AdventureTransitionCooldown. Reduced from 30 to 18 when SEH available (~1.2s).</summary>
@@ -210,14 +218,15 @@ namespace SRWYAccess
         /// </summary>
         public static void ApplySEHTimings()
         {
-            NoneProbeThresholdEffective = 15;      // ~1s (was 55 = 3.7s)
-            GuardWarmupCyclesEffective = 3;         // ~200ms (was 8 = 530ms)
-            GuardStabilityThresholdEffective = 5;   // ~333ms (was 15 = 1s)
+            NoneProbeThresholdEffective = 12;      // ~800ms (was 55 = 3.7s)
+            GuardWarmupCyclesEffective = 2;         // ~133ms (was 8 = 530ms)
+            GuardStabilityThresholdEffective = 3;   // ~200ms (was 15 = 1s)
             GuardMaxCyclesEffective = 150;          // 10s (was 900 = 60s)
-            SearchCooldownEffective = 2;            // ~133ms (was 3 = 200ms)
-            TacticalTransitionCooldownEffective = 6; // ~400ms (was 8 = 530ms)
-            AdvSearchCooldownEffective = 12;         // ~800ms (was 23 = 1.5s)
+            SearchCooldownEffective = 1;            // ~67ms (was 3 = 200ms)
+            TacticalTransitionCooldownEffective = 4; // ~267ms (was 8 = 530ms)
+            AdvSearchCooldownEffective = 8;          // ~533ms (was 23 = 1.5s)
             AdventureTransitionCooldownEffective = 18; // ~1.2s (was 30 = 2s)
+            AdventureBlackoutFramesEffective = 24;     // ~400ms (was 60 = 1s)
         }
     }
 }

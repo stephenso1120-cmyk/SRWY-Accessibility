@@ -188,7 +188,7 @@ namespace SRWYAccess
 
         // FindObjectsOfType throttling
         private static int _lastFOTFrame = 0;
-        private const int FOT_MIN_INTERVAL = 30; // ~500ms at 60fps
+        private const int FOT_MIN_INTERVAL = 15; // ~250ms at 60fps
 
         // Safe mode: graceful degradation when too many critical errors occur
         private static int _criticalErrors = 0;
@@ -803,8 +803,15 @@ namespace SRWYAccess
             // cursor reads, TMP text reads) to prevent uncatchable AV.
             // Guard warmup resets NoModeMatched to false (above check misses it),
             // so this explicit check catches the remaining guard cycles.
+            // Allow _searchCooldown to decrement during guard: guard already provides
+            // equivalent protection, so running them concurrently saves ~333ms on
+            // adventure transitions (cooldown starts counting during guard instead of after).
             if (GameStateTracker.IsInGuardMode)
+            {
+                if (isStandardTick && _searchCooldown > 0)
+                    _searchCooldown--;
                 return;
+            }
 
             // Behaviour pointer changed within same mode
             if (GameStateTracker.BehaviourJustChanged)
@@ -985,6 +992,17 @@ namespace SRWYAccess
             {
                 _battlePoll = 0;
 
+                // Q/E unit switching while tactical command menu is open (NONE+postTactical):
+                // Detect unit change BEFORE GenericMenuReader so the unit name can be
+                // prepended to whatever menu item GenericMenuReader announces.
+                if (currentMode == InputManager.InputMode.NONE && _postTactical)
+                {
+                    _tacticalMapHandler?.UpdateUnitOnlySilent();
+                    string switchedUnit = _tacticalMapHandler?.ConsumePendingUnitSwitch();
+                    if (!string.IsNullOrEmpty(switchedUnit))
+                        _genericMenuReader?.SetUnitSwitchPrefix(switchedUnit);
+                }
+
                 // GenericMenuReader (safe on main thread, including during ADVENTURE)
                 _breadcrumb = 41; // GenericMenuReader
                 bool canSearchMenu = searchAllowed && (_searchSlot == 0);
@@ -1085,7 +1103,6 @@ namespace SRWYAccess
                     {
                         _tacticalMapHandler?.UpdateUnitOnly(searchAllowed && _searchSlot == 2);
                     }
-
                     // MAP weapon target count (runs during all tactical modes;
                     // handler itself checks for active PlayerAttackMapWeaponTask)
                     _mapWeaponTargetHandler?.Update();
@@ -1131,6 +1148,15 @@ namespace SRWYAccess
 
                 if (lastWasTactical && newMode == InputManager.InputMode.NONE)
                 {
+                    // Only announce unit name on first entry (not after Move/Attack re-entry).
+                    // _postTactical stays true throughout the command session, so checking
+                    // it here distinguishes first open (false) from re-entry (true).
+                    if (!_postTactical)
+                    {
+                        string unitInfo = _tacticalMapHandler?.LastUnitInfo;
+                        if (!string.IsNullOrEmpty(unitInfo))
+                            _genericMenuReader?.SetPendingUnitAnnouncement(unitInfo);
+                    }
                     _postTactical = true;
                     _noneProbeActive = false;
                     ReleaseUIHandlers();
@@ -1189,8 +1215,8 @@ namespace SRWYAccess
                     // Adventure→NONE uses longer blackout (~1s) for heavy
                     // scene transitions (full scene destroy + load).
                     _transitionBlackout = lastWasTactical
-                        ? ModConfig.TacticalBlackoutFrames  // ~167ms
-                        : 60;                               // ~1s
+                        ? ModConfig.TacticalBlackoutFrames  // ~100ms
+                        : ModConfig.AdventureBlackoutFramesEffective; // ~400ms with SEH, ~1s without
                     // Crash #28: ADVENTURE→NONE must suppress the NONE probe.
                     // The game's scene objects are still being cleaned up for
                     // several seconds after the mode change. FindObjectsOfType
