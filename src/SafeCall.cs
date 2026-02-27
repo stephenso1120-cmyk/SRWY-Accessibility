@@ -26,7 +26,7 @@ namespace SRWYAccess
     internal static class SafeCall
     {
         private static bool _available;
-        private static bool _initialized;
+        private static int _initializedFlag;  // 0 = not initialized, 1 = initialized (thread-safe with Interlocked)
 
         // Native method pointers (read from Il2CppMethodInfo offset 0)
         private static IntPtr _fnGetCurrentInputBehaviour;
@@ -181,8 +181,10 @@ namespace SRWYAccess
         /// </summary>
         public static unsafe void Initialize()
         {
-            if (_initialized) return;
-            _initialized = true;
+            // Thread-safe initialization using Interlocked.CompareExchange
+            // Prevents race condition when multiple threads call Initialize() simultaneously
+            if (System.Threading.Interlocked.CompareExchange(ref _initializedFlag, 1, 0) != 0)
+                return;
 
             // Step 1: Load and init the native DLL
             try

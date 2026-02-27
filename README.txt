@@ -2,7 +2,7 @@
 SRWYAccess - Super Robot Wars Y Accessibility Mod
 ========================================
 
-Version: 2.4
+Version: 2.45
 Game: Super Robot Wars Y
 Supported Languages: English, Simplified Chinese, Traditional Chinese, Japanese, Korean
 
@@ -401,7 +401,7 @@ Alt+/: Next unacted
 Ctrl+.: Previous acted
 Ctrl+/: Next acted
 
-\: Repeat last
+\: Repeat last / Sortie info
 Alt+\: Mission destination
 Ctrl+\: Enemy nearest to dest
 P: Path prediction

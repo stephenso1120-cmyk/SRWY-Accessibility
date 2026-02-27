@@ -13,7 +13,7 @@ using Il2CppCom.BBStudio.SRTeam.UIs;
 using Il2CppCom.BBStudio.SRTeam.UI.StrategyPart.Option;
 using MonoMod.RuntimeDetour;
 
-[assembly: MelonInfo(typeof(SRWYAccess.SRWYAccessMod), "SRWYAccess", "2.3.5", "SRWYAccess Team")]
+[assembly: MelonInfo(typeof(SRWYAccess.SRWYAccessMod), "SRWYAccess", "2.4.1", "SRWYAccess Team")]
 [assembly: MelonGame("Bandai Namco Entertainment", "SUPER ROBOT WARS Y")]
 
 namespace SRWYAccess
@@ -166,6 +166,7 @@ namespace SRWYAccess
         private static ScreenReviewManager _screenReviewManager;
         private static SupporterHandler _supporterHandler;
         private static SystemOptionHandler _systemOptionHandler;
+        private static MissionDetailHandler _missionDetailHandler;
 
         // Main thread state (only accessed from main thread after _initialized = true)
         private static int _frameCount;
@@ -203,6 +204,7 @@ namespace SRWYAccess
         private static bool _lastKeyPeriod;
         private static bool _lastKeySlash;
         private static bool _lastKeyBackslash;
+        private static bool _lastKeyBackslashSortie; // \ key for sortie prep (separate from tactical map usage)
         private static bool _lastKeyP;
         private static bool _lastKeyQ;
         private static bool _lastKeyE;
@@ -543,6 +545,7 @@ namespace SRWYAccess
                 _unitDistanceHandler = new UnitDistanceHandler();
                 _supporterHandler = new SupporterHandler();
                 _systemOptionHandler = new SystemOptionHandler();
+                _missionDetailHandler = new MissionDetailHandler();
                 _screenReviewManager = new ScreenReviewManager(
                     _genericMenuReader, _dialogHandler, _tutorialHandler,
                     _adventureDialogueHandler, _battleSubtitleHandler,
@@ -600,6 +603,21 @@ namespace SRWYAccess
             {
                 _initialized = false;
                 _shutdownRequested = true;
+
+                // Release GCHandle to prevent resource leak
+                if (_hookGcHandle.IsAllocated)
+                {
+                    try
+                    {
+                        _hookGcHandle.Free();
+                        DebugHelper.Write("ProcessExit: GCHandle released.");
+                    }
+                    catch (Exception ex)
+                    {
+                        DebugHelper.Write($"ProcessExit: Failed to free GCHandle: {ex.Message}");
+                    }
+                }
+
                 SafeCall.Shutdown();
                 ScreenReaderOutput.Shutdown();
                 DebugHelper.Close();
@@ -714,6 +732,14 @@ namespace SRWYAccess
             int pollInterval = useFastPoll
                 ? ModConfig.FastPollFrameInterval
                 : ModConfig.PollFrameInterval;
+
+            // Defensive check: ensure pollInterval is positive to prevent division by zero
+            if (pollInterval <= 0)
+            {
+                DebugHelper.Write($"WARNING: Invalid pollInterval={pollInterval}, defaulting to 2");
+                pollInterval = 2;
+            }
+
             if (_frameCount % pollInterval != 0) return;
 
             // Key checks on poll frames (skip during guard mode - no interactive UI)
@@ -721,6 +747,7 @@ namespace SRWYAccess
             {
                 CheckReviewKeys();
                 CheckDistanceKeys();
+                CheckSortieInfoKey();
 
                 CheckRangeKeys();
                 CheckTabSwitchKeys();
@@ -972,6 +999,9 @@ namespace SRWYAccess
                 // System option handler (column-based cursor + value tracking)
                 _systemOptionHandler?.Update(canSearchMenu);
 
+                // Mission detail handler: DISABLED - functionality integrated into GenericMenuReader
+                // _missionDetailHandler?.Update(canSearchMenu);
+
                 _breadcrumb = 42; // GenericMenuReader done
                 if (menuLost)
                 {
@@ -1023,6 +1053,7 @@ namespace SRWYAccess
                         _tacticalMapHandler?.ReleaseHandler();
                         _unitDistanceHandler?.ReleaseHandler();
                         _supporterHandler?.ReleaseHandler();
+                        _missionDetailHandler?.ReleaseHandler();
                         return;
                     }
 
@@ -1212,6 +1243,7 @@ namespace SRWYAccess
             _supporterHandler?.ReleaseHandler();
             _mapWeaponTargetHandler?.Reset();
             _systemOptionHandler?.ReleaseHandler();
+            _missionDetailHandler?.ReleaseHandler();
             if (!keepResultHandler)
                 _battleResultHandler?.ReleaseHandler();
         }
@@ -1386,6 +1418,83 @@ namespace SRWYAccess
             _lastKeyF4 = keyF4;
         }
 
+        /// <summary>
+        /// Read sortie preparation info (unit/ship count) from SortiePreparationManager.
+        /// Called when \ key is pressed in sortie preparation screen (NONE/STRATEGY_PART mode).
+        /// </summary>
+        private static void ReadSortieInfo()
+        {
+            DebugHelper.Write("ReadSortieInfo: Starting...");
+            try
+            {
+                // Find SortiePreparationManager object
+                var sortieManager = UnityEngine.Object.FindObjectOfType<SortiePreparationManager>();
+                if ((object)sortieManager == null)
+                {
+                    DebugHelper.Write("ReadSortieInfo: SortiePreparationManager not found");
+                    ScreenReaderOutput.Say(Loc.Get("sortie_info_not_available"));
+                    return;
+                }
+
+                DebugHelper.Write($"ReadSortieInfo: Found SortiePreparationManager at {sortieManager.Pointer:X}");
+
+                if (!SafeCall.ProbeObject(sortieManager.Pointer))
+                {
+                    DebugHelper.Write("ReadSortieInfo: ProbeObject failed");
+                    return;
+                }
+
+                var parts = new System.Collections.Generic.List<string>();
+
+                // Read unit count using GetSelectedSortieNum and GetRemainSortieNum
+                try
+                {
+                    int selectedUnits = sortieManager.GetSelectedSortieNum(SortiePreparationManager.SelectSoriteType.Unit);
+                    int remainUnits = sortieManager.GetRemainSortieNum(SortiePreparationManager.SelectSoriteType.Unit);
+                    int totalUnits = selectedUnits + remainUnits;
+
+                    string unitCount = $"{selectedUnits}/{totalUnits}";
+                    parts.Add(Loc.Get("sortie_unit_count", unitCount));
+                    DebugHelper.Write($"ReadSortieInfo: Unit count: {unitCount}");
+                }
+                catch (Exception ex)
+                {
+                    DebugHelper.Write($"ReadSortieInfo: Error reading unit count: {ex.Message}");
+                }
+
+                // Read ship count
+                try
+                {
+                    int selectedShips = sortieManager.GetSelectedSortieNum(SortiePreparationManager.SelectSoriteType.Ship);
+                    int remainShips = sortieManager.GetRemainSortieNum(SortiePreparationManager.SelectSoriteType.Ship);
+                    int totalShips = selectedShips + remainShips;
+
+                    string shipCount = $"{selectedShips}/{totalShips}";
+                    parts.Add(Loc.Get("sortie_ship_count", shipCount));
+                    DebugHelper.Write($"ReadSortieInfo: Ship count: {shipCount}");
+                }
+                catch (Exception ex)
+                {
+                    DebugHelper.Write($"ReadSortieInfo: Error reading ship count: {ex.Message}");
+                }
+
+                if (parts.Count > 0)
+                {
+                    string announcement = string.Join(". ", parts);
+                    ScreenReaderOutput.Say(announcement);
+                    DebugHelper.Write($"ReadSortieInfo: Announced: {announcement}");
+                }
+                else
+                {
+                    DebugHelper.Write("ReadSortieInfo: No info to announce");
+                }
+            }
+            catch (Exception ex)
+            {
+                DebugHelper.Write($"ReadSortieInfo: FAULT: {ex.GetType().Name}: {ex.Message}");
+            }
+        }
+
         private static bool _battleAnimCheckFailed;
         private static int _battleAnimPollCount;
         private static void CheckBattleAnimationSetting()
@@ -1551,6 +1660,40 @@ namespace SRWYAccess
         /// Check ;/' (enemy distance) and .// (ally distance) keys.
         /// Only active during TACTICAL_PART mode (map navigation/movement).
         /// </summary>
+        /// <summary>
+        /// Check \ key for sortie preparation info (unit count).
+        /// Active in NONE and STRATEGY_PART modes (sortie prep screen).
+        /// </summary>
+        private static void CheckSortieInfoKey()
+        {
+            if (_isInLoadingState || _searchCooldown > 0) return;
+
+            var currentMode = GameStateTracker.CurrentMode;
+
+            // Check if we're in sortie preparation mode (NONE or STRATEGY_PART)
+            bool inSortieMode = currentMode == InputManager.InputMode.NONE
+                || currentMode == InputManager.InputMode.STRATEGY_PART;
+
+            if (!inSortieMode)
+            {
+                _lastKeyBackslashSortie = false;
+                return;
+            }
+
+            bool keyBackslash = (GetAsyncKeyState(VK_OEM_5) & 0x8000) != 0;
+
+            if (keyBackslash && !_lastKeyBackslashSortie)
+            {
+                _lastKeyBackslashSortie = true;
+                DebugHelper.Write($"CheckSortieInfoKey: \\ key pressed in mode {currentMode}");
+                ReadSortieInfo();
+            }
+            else if (!keyBackslash)
+            {
+                _lastKeyBackslashSortie = false;
+            }
+        }
+
         private static void CheckDistanceKeys()
         {
             if (_unitDistanceHandler == null) return;

@@ -1,6 +1,6 @@
 # SRWYAccess - Super Robot Wars Y Accessibility Mod
 
-Version: 2.4
+Version: 2.45
 Game: Super Robot Wars Y (Steam)
 Supported Languages: English, Simplified Chinese, Traditional Chinese, Japanese, Korean
 
@@ -102,6 +102,10 @@ Place files from the release archive:
 - =: Announce movement range
 - -: Announce attack range
 
+### Sortie Preparation
+
+- \: Read selected unit/ship counts (updates dynamically as units are selected)
+
 ## Automatic Features
 
 ### Menu Reading
@@ -151,6 +155,11 @@ Place files from the release archive:
 - Mod pauses when the game window is not focused (Alt-Tab safe)
 
 ## Changelog
+
+### v2.45 (2026-02-27)
+
+- New: Mission selection screen automatically reads mission details when cursor moves (description, location, recommended rank)
+- New: Sortie preparation screen - press \ to read selected unit/ship counts (dynamically updates as units are selected/deselected)
 
 ### v2.4 (2026-02-25)
 

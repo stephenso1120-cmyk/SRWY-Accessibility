@@ -576,6 +576,50 @@ namespace SRWYAccess
                 "スキップ",
                 "건너뛰기");
 
+            // ===== MISSION SELECTION DETAIL =====
+            Add("mission_location",
+                "Location",
+                "地点",
+                "地點",
+                "場所",
+                "위치");
+
+            Add("mission_recommend_rank",
+                "Recommended rank",
+                "推荐等级",
+                "推薦等級",
+                "推奨ランク",
+                "권장 랭크");
+
+            // ===== SORTIE PREPARATION =====
+            Add("sortie_unit_count",
+                "Units: {0}",
+                "出击机体：{0}",
+                "出擊機體：{0}",
+                "出撃ユニット：{0}",
+                "출격 유닛: {0}");
+
+            Add("sortie_ship_count",
+                "Ships: {0}",
+                "出击舰船：{0}",
+                "出擊艦船：{0}",
+                "出撃艦船：{0}",
+                "출격 함선: {0}");
+
+            Add("sortie_difficulty",
+                "Difficulty: {0}",
+                "难度：{0}",
+                "難度：{0}",
+                "難易度：{0}",
+                "난이도: {0}");
+
+            Add("sortie_info_not_available",
+                "Sortie info not available",
+                "出击信息不可用",
+                "出擊資訊不可用",
+                "出撃情報が利用できません",
+                "출격 정보 사용 불가");
+
             // ===== ADVENTURE DIALOGUE (C1) =====
             Add("dialogue_line",
                 "{0}: {1}",
@@ -2542,6 +2586,70 @@ namespace SRWYAccess
             Add("custom_stat_mo", "Mobility", "\u8FD0\u52A8\u6027", "\u904B\u52D5\u6027", "\u904B\u52D5\u6027", "\uC6B4\uB3D9\uC131");
             Add("custom_stat_si", "Accuracy", "\u7167\u51C6", "\u7167\u6E96", "\u7167\u6E96", "\uC870\uC900");
             Add("custom_stat_wp", "Weapons", "\u6B66\u5668", "\u6B66\u5668", "\u6B66\u5668", "\uBB34\uAE30");
+
+            // ===== SEARCH UNIT SCREEN =====
+            Add("search_unit_screen",
+                "Unit Search",
+                "单位搜索",
+                "單位搜尋",
+                "ユニット検索",
+                "유닛 검색");
+
+            Add("search_mode_category",
+                "Category Selection",
+                "类别选择",
+                "類別選擇",
+                "カテゴリー選択",
+                "카테고리 선택");
+
+            Add("search_mode_item",
+                "Item Selection",
+                "项目选择",
+                "項目選擇",
+                "アイテム選択",
+                "항목 선택");
+
+            Add("search_mode_result",
+                "Search Results",
+                "搜索结果",
+                "搜尋結果",
+                "検索結果",
+                "검색 결과");
+
+            Add("search_mode_unknown",
+                "Unknown Mode",
+                "未知模式",
+                "未知模式",
+                "不明なモード",
+                "알 수 없는 모드");
+
+            Add("search_category_spirit",
+                "Spirit",
+                "精神",
+                "精神",
+                "精神",
+                "정신");
+
+            Add("search_category_skill",
+                "Skill",
+                "技能",
+                "技能",
+                "スキル",
+                "스킬");
+
+            Add("search_category_ability",
+                "Ability",
+                "能力",
+                "能力",
+                "アビリティ",
+                "어빌리티");
+
+            Add("search_category_unknown",
+                "Unknown Category",
+                "未知类别",
+                "未知類別",
+                "不明なカテゴリー",
+                "알 수 없는 카테고리");
 
         }
     }

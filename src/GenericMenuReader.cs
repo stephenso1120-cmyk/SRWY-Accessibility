@@ -197,6 +197,13 @@ namespace SRWYAccess
         private int _lastCustomRobotIndex = -1;
         private IntPtr _lastSelectedButtonPtr = IntPtr.Zero;
 
+        // SearchUnitTopUIHandler tracking: mode + indices for Category/Item/Result
+        private int _lastSearchSelectMode = -1;  // SelectMode enum
+        private int _lastSearchCategory = -1;    // searchCategory enum
+        private int _lastSearchItemIndex = -1;   // CurrentItemIndex[currentCategory]
+        private int _lastSearchResult = -1;      // SearchResult enum (Pilot/Robot)
+        private int _lastSearchResultIndex = -1; // CurrentResultIndex
+
         // Deferred description read: the game updates TMP description text
         // (explanationText, descriptionText) AFTER our hook runs in
         // InputManager.Update(). Reading immediately on cursor change gets
@@ -431,6 +438,11 @@ namespace SRWYAccess
             // Track CurrentSpiritBtnHandler pointer changes instead.
             if (_activeHandlerType == "TacticalPartSpiritUIHandler")
                 return UpdateSpiritHandler();
+
+            // Special: SearchUnitTopUIHandler has three modes (Category/Item/Result).
+            // Each mode uses different indices and handlers.
+            if (_activeHandlerType == "SearchUnitTopUIHandler")
+                return UpdateSearchHandler();
 
             // Special: TacticalOthersCommandUIHandler uses same SpiritButtonHandler
             // pattern. Track CurrentOtherCommandBtnHandler pointer changes.
@@ -749,7 +761,9 @@ namespace SRWYAccess
 
                 // Handler-specific description readers only.
                 // Only handlers with known description TMP fields are supported.
-                if (_activeHandlerType == "PilotTrainingUIHandler")
+                if (_activeHandlerType == "MissionUIHandler")
+                    descText = ReadMissionDetailInfoText();
+                else if (_activeHandlerType == "PilotTrainingUIHandler")
                     descText = ReadPilotTrainingDescriptionText();
                 else if (_activeHandlerType == "ShopUIHandler")
                     descText = ReadShopDescriptionText();
@@ -980,6 +994,57 @@ namespace SRWYAccess
         }
 
         /// <summary>Read description text from PilotTrainingUIHandler without announcing.</summary>
+        /// <summary>
+        /// Read mission detail info (description, location, rank) from MissionDetailInfo.
+        /// This runs 3 cycles after cursor change, giving the game time to update the TMP text.
+        /// </summary>
+        private string ReadMissionDetailInfoText()
+        {
+            try
+            {
+                // Find MissionDetailInfo object
+                var detailInfo = UnityEngine.Object.FindObjectOfType<MissionDetailInfo>();
+                if ((object)detailInfo == null)
+                    return null;
+
+                if (!SafeCall.ProbeObject(detailInfo.Pointer))
+                    return null;
+
+                // Check if data is loading
+                bool isLoading = false;
+                try { isLoading = detailInfo.MissionDetailLoading; } catch { }
+                if (isLoading)
+                    return null;
+
+                var parts = new List<string>();
+
+                // Description (main content)
+                string desc = ReadTmpSafe(detailInfo.dtDescription);
+                if (!string.IsNullOrWhiteSpace(desc))
+                    parts.Add(desc);
+
+                // Location
+                string loc = ReadTmpSafe(detailInfo.dtPointName);
+                if (!string.IsNullOrWhiteSpace(loc))
+                    parts.Add(Loc.Get("mission_location") + ": " + loc);
+
+                // Recommended rank
+                string rank = ReadTmpSafe(detailInfo.dtRecommendRank);
+                if (!string.IsNullOrWhiteSpace(rank))
+                    parts.Add(Loc.Get("mission_recommend_rank") + ": " + rank);
+
+                if (parts.Count > 0)
+                    return string.Join(". ", parts);
+
+                return null;
+            }
+            catch (Exception ex)
+            {
+                DebugHelper.Write($"GenericMenu: ReadMissionDetailInfoText error: {ex.Message}");
+                return null;
+            }
+        }
+
         private string ReadPilotTrainingDescriptionText()
         {
             try
@@ -3393,6 +3458,197 @@ namespace SRWYAccess
         }
 
         /// <summary>
+        /// Track SearchUnitTopUIHandler mode and cursor changes.
+        /// Three modes: Category (select Spirit/Skill/Ability), Item (select specific item),
+        /// Result (select Pilot/Robot from search results).
+        /// Each mode uses different indices and handlers.
+        /// </summary>
+        private bool UpdateSearchHandler()
+        {
+            // Screen name announcement for new handler
+            if (_newHandlerJustFound)
+            {
+                _newHandlerJustFound = false;
+                string screenName = Loc.Get("search_unit_screen");
+                ScreenReaderOutput.Say(screenName);
+            }
+
+            try
+            {
+                var searchHandler = _activeHandler.TryCast<SearchUnitTopUIHandler>();
+                if ((object)searchHandler == null) return false;
+
+                // Probe handler before accessing IL2CPP fields
+                if (!SafeCall.ProbeObject(searchHandler.Pointer)) return false;
+
+                // Read current mode and state
+                int selectMode = (int)searchHandler.currentSelectMode;
+
+                // Mode change detection
+                if (selectMode != _lastSearchSelectMode)
+                {
+                    _lastSearchSelectMode = selectMode;
+                    _lastSearchCategory = -1;
+                    _lastSearchItemIndex = -1;
+                    _lastSearchResult = -1;
+                    _lastSearchResultIndex = -1;
+                    _stalePollCount = 0;
+
+                    // Announce mode change
+                    string modeName = selectMode switch
+                    {
+                        0 => Loc.Get("search_mode_category"),  // Category
+                        1 => Loc.Get("search_mode_item"),      // Item
+                        2 => Loc.Get("search_mode_result"),    // Result
+                        _ => Loc.Get("search_mode_unknown")
+                    };
+                    ScreenReaderOutput.Say(modeName);
+                }
+
+                // Handle each mode
+                switch (selectMode)
+                {
+                    case 0: // Category mode
+                        return UpdateSearchCategoryMode(searchHandler);
+                    case 1: // Item mode
+                        return UpdateSearchItemMode(searchHandler);
+                    case 2: // Result mode
+                        return UpdateSearchResultMode(searchHandler);
+                }
+            }
+            catch (Exception ex)
+            {
+                DebugHelper.Write($"UpdateSearchHandler fault: {ex.Message}");
+                _faultCount++;
+                if (_faultCount >= ModConfig.MenuMaxFaults)
+                {
+                    ReleaseHandler();
+                    return false;
+                }
+            }
+
+            if (_faultCount > 0) _faultCount = 0;
+            return false;
+        }
+
+        /// <summary>
+        /// Category mode: selecting Spirit/Skill/Ability category
+        /// </summary>
+        private bool UpdateSearchCategoryMode(SearchUnitTopUIHandler handler)
+        {
+            int category = (int)handler.currentCategory;
+
+            if (category != _lastSearchCategory)
+            {
+                _lastSearchCategory = category;
+                _stalePollCount = 0;
+
+                string categoryName = category switch
+                {
+                    0 => Loc.Get("search_category_spirit"),   // Spirit
+                    1 => Loc.Get("search_category_skill"),    // Skill
+                    2 => Loc.Get("search_category_ability"),  // Ability
+                    _ => Loc.Get("search_category_unknown")
+                };
+
+                ScreenReaderOutput.Say(categoryName);
+            }
+            else
+            {
+                _stalePollCount++;
+            }
+
+            return false;
+        }
+
+        /// <summary>
+        /// Item mode: selecting specific Spirit/Skill/Ability from list
+        /// Uses ItemListHandler[currentCategory] and CurrentItemIndex[currentCategory]
+        /// </summary>
+        private bool UpdateSearchItemMode(SearchUnitTopUIHandler handler)
+        {
+            int category = (int)handler.currentCategory;
+            var itemIndexArray = handler.CurrentItemIndex;
+
+            if ((object)itemIndexArray == null || category < 0 || category >= itemIndexArray.Length)
+                return false;
+
+            int itemIndex = itemIndexArray[category];
+
+            if (itemIndex != _lastSearchItemIndex || category != _lastSearchCategory)
+            {
+                _lastSearchItemIndex = itemIndex;
+                _lastSearchCategory = category;
+                _stalePollCount = 0;
+
+                // Get the list handler for this category
+                var itemHandlers = handler.ItemListHandler;
+                if ((object)itemHandlers == null || category >= itemHandlers.Count)
+                    return false;
+
+                var listHandler = itemHandlers[category];
+                if ((object)listHandler == null || !SafeCall.ProbeObject(listHandler.Pointer))
+                    return false;
+
+                // Read item text using ListHandlerBase
+                _listHandler = listHandler;
+                string text = ReadListItemText(itemIndex);
+
+                if (!string.IsNullOrWhiteSpace(text))
+                {
+                    ScreenReaderOutput.Say(text);
+                }
+            }
+            else
+            {
+                _stalePollCount++;
+            }
+
+            return false;
+        }
+
+        /// <summary>
+        /// Result mode: selecting Pilot/Robot from search results
+        /// Uses ResultListHandler[currentResult] and CurrentResultIndex
+        /// </summary>
+        private bool UpdateSearchResultMode(SearchUnitTopUIHandler handler)
+        {
+            int result = (int)handler.currentResult;
+            int resultIndex = handler.CurrentResultIndex;
+
+            if (resultIndex != _lastSearchResultIndex || result != _lastSearchResult)
+            {
+                _lastSearchResultIndex = resultIndex;
+                _lastSearchResult = result;
+                _stalePollCount = 0;
+
+                // Get the list handler for this result type
+                var resultHandlers = handler.ResultListHandler;
+                if ((object)resultHandlers == null || result < 0 || result >= resultHandlers.Count)
+                    return false;
+
+                var listHandler = resultHandlers[result];
+                if ((object)listHandler == null || !SafeCall.ProbeObject(listHandler.Pointer))
+                    return false;
+
+                // Read result text using UnitListHandler (inherits from ListHandlerBase)
+                _listHandler = listHandler;
+                string text = ReadListItemText(resultIndex);
+
+                if (!string.IsNullOrWhiteSpace(text))
+                {
+                    ScreenReaderOutput.Say(text);
+                }
+            }
+            else
+            {
+                _stalePollCount++;
+            }
+
+            return false;
+        }
+
+        /// <summary>
         /// Track TacticalOthersCommandUIHandler cursor changes.
         /// Same SpiritButtonHandler pattern as spirit handler - tracks
         /// CurrentOtherCommandBtnHandler pointer instead of currentCursorIndex.
@@ -5642,7 +5898,8 @@ namespace SRWYAccess
         }
 
         /// <summary>
-        /// Read mission area name from MissionUIHandler.areaName TMP.
+        /// Read mission area name from MissionUIHandler.areaName TMP
+        /// AND mission detail info from MissionDetailInfo if available.
         /// </summary>
         private void CollectMissionInfo(List<string> items)
         {
@@ -5660,6 +5917,36 @@ namespace SRWYAccess
                         string t = ReadTmpSafe(tmp);
                         if (!string.IsNullOrWhiteSpace(t))
                             items.Add(t);
+                    }
+                }
+                catch { }
+
+                // Mission detail info (description, location, rank)
+                try
+                {
+                    var detailInfo = UnityEngine.Object.FindObjectOfType<MissionDetailInfo>();
+                    if ((object)detailInfo != null && SafeCall.ProbeObject(detailInfo.Pointer))
+                    {
+                        // Skip if data is loading
+                        bool isLoading = false;
+                        try { isLoading = detailInfo.MissionDetailLoading; } catch { }
+                        if (!isLoading)
+                        {
+                            // Description
+                            string desc = ReadTmpSafe(detailInfo.dtDescription);
+                            if (!string.IsNullOrWhiteSpace(desc))
+                                items.Add(desc);
+
+                            // Location
+                            string loc = ReadTmpSafe(detailInfo.dtPointName);
+                            if (!string.IsNullOrWhiteSpace(loc))
+                                items.Add(Loc.Get("mission_location") + ": " + loc);
+
+                            // Recommended rank
+                            string rank = ReadTmpSafe(detailInfo.dtRecommendRank);
+                            if (!string.IsNullOrWhiteSpace(rank))
+                                items.Add(Loc.Get("mission_recommend_rank") + ": " + rank);
+                        }
                     }
                 }
                 catch { }
