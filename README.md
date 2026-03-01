@@ -1,6 +1,6 @@
 # SRWYAccess - Super Robot Wars Y Accessibility Mod
 
-Version: 2.5
+Version: 2.57
 Game: Super Robot Wars Y (Steam)
 Supported Languages: English, Simplified Chinese, Traditional Chinese, Japanese, Korean
 
@@ -156,6 +156,12 @@ Place files from the release archive:
 - Mod pauses when the game window is not focused (Alt-Tab safe)
 
 ## Changelog
+
+### v2.57 (2026-03-01)
+
+- Fixed: Audio distortion and noise caused by mod audio cues - replaced legacy winmm.dll PlaySound with Unity AudioSource system, eliminating all conflicts with the game's audio pipeline
+- Fixed: Input lag during rapid menu navigation - removed per-frame disk I/O and console logging from hot path
+- Improved: Screen reader response speed - reduced minimum Tolk interval from 50ms to 30ms, removed call rate limit
 
 ### v2.5 (2026-02-28)
 

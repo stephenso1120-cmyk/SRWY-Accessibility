@@ -1,5 +1,5 @@
 $stagingDir = "C:\Users\steph\Documents\SRWY\SRWY\Accessibility-Mod-Template\release-staging"
-$zipPath = "C:\Users\steph\Documents\SRWY\SRWY\Accessibility-Mod-Template\SRWYAccess-v2.5.zip"
+$zipPath = "C:\Users\steph\Documents\SRWY\SRWY\Accessibility-Mod-Template\SRWYAccess-v2.57.zip"
 
 # Clean staging
 if (Test-Path $stagingDir) { Remove-Item $stagingDir -Recurse -Force }

@@ -143,8 +143,9 @@ namespace SRWYAccess
 
         // ===== DebugHelper =====
 
-        /// <summary>Flush log buffer every N writes.</summary>
-        public const int LogFlushInterval = 5;
+        /// <summary>Flush log buffer every N writes. Higher value reduces disk I/O
+        /// frequency during rapid navigation (each flush is a synchronous disk write).</summary>
+        public const int LogFlushInterval = 50;
 
         // ===== Screen Review =====
 

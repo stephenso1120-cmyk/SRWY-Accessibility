@@ -13,7 +13,7 @@ using Il2CppCom.BBStudio.SRTeam.UIs;
 using Il2CppCom.BBStudio.SRTeam.UI.StrategyPart.Option;
 using MonoMod.RuntimeDetour;
 
-[assembly: MelonInfo(typeof(SRWYAccess.SRWYAccessMod), "SRWYAccess", "2.4.1", "SRWYAccess Team")]
+[assembly: MelonInfo(typeof(SRWYAccess.SRWYAccessMod), "SRWYAccess", "2.5.7", "SRWYAccess Team")]
 [assembly: MelonGame("Bandai Namco Entertainment", "SUPER ROBOT WARS Y")]
 
 namespace SRWYAccess
@@ -618,6 +618,7 @@ namespace SRWYAccess
                     }
                 }
 
+                AudioCueManager.Shutdown();
                 SafeCall.Shutdown();
                 ScreenReaderOutput.Shutdown();
                 DebugHelper.Close();
@@ -652,6 +653,10 @@ namespace SRWYAccess
         internal static void OnMainThreadUpdate()
         {
             if (!_initialized || _shutdownRequested) return;
+
+            // Create Unity AudioSource on first main thread frame (Phase 2 of audio init).
+            // Phase 1 (sample generation) ran on background thread during mod startup.
+            AudioCueManager.EnsureMainThreadInit();
 
             // Skip all mod logic when game window is not focused.
             // GetAsyncKeyState is global and would capture keys from other apps.
@@ -1110,7 +1115,6 @@ namespace SRWYAccess
             }
 
             _breadcrumb = 99; // completed successfully
-            DebugHelper.Flush(); // ensure handler results are written before potential crash
         }
 
         private static void HandleModeChange(InputManager.InputMode newMode)

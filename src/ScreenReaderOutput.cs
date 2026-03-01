@@ -7,6 +7,11 @@ namespace SRWYAccess
     /// <summary>
     /// Wrapper for Tolk screen reader communication library.
     /// Provides P/Invoke access to Tolk.dll for NVDA/JAWS output.
+    ///
+    /// Performance: all logging uses DebugHelper (buffered, no per-call I/O)
+    /// instead of MelonLogger (console + file I/O per call). Rate limiting
+    /// and deduplication prevent overwhelming the screen reader during
+    /// rapid navigation.
     /// </summary>
     public static class ScreenReaderOutput
     {
@@ -21,10 +26,7 @@ namespace SRWYAccess
 
         // Rate limiting: prevent overwhelming Tolk.dll/screen reader with rapid calls
         private static long _lastTolkCallTicks;
-        private static readonly long MinTolkIntervalTicks = 50 * TimeSpan.TicksPerMillisecond; // 50ms minimum between calls
-        private static int _tolkCallsThisSecond;
-        private static long _tolkCallsSecondStart;
-        private const int MaxTolkCallsPerSecond = 10; // safety limit
+        private static readonly long MinTolkIntervalTicks = 30 * TimeSpan.TicksPerMillisecond; // 30ms minimum between calls
 
         #region Tolk P/Invoke
 
@@ -124,36 +126,20 @@ namespace SRWYAccess
 
             long now = DateTime.UtcNow.Ticks;
 
-            // Deduplicate: skip if same message within 300ms window
+            // Deduplicate: skip if same message within window
             if (message == _lastSpokenText && (now - _lastSpokenTicks) < DedupWindowTicks)
                 return;
 
-            // Rate limiting: enforce minimum interval between ANY calls
+            // Rate limiting: enforce minimum interval between Tolk calls
             if ((now - _lastTolkCallTicks) < MinTolkIntervalTicks)
-            {
-                try { MelonLogger.Warning($"[SRWYAccess] [SR-THROTTLED] {message}"); } catch { }
                 return;
-            }
-
-            // Rate limiting: per-second call counter
-            if (now - _tolkCallsSecondStart > TimeSpan.TicksPerSecond)
-            {
-                _tolkCallsThisSecond = 0;
-                _tolkCallsSecondStart = now;
-            }
-            if (_tolkCallsThisSecond >= MaxTolkCallsPerSecond)
-            {
-                try { MelonLogger.Warning($"[SRWYAccess] [SR-RATELIMIT] {message}"); } catch { }
-                return;
-            }
 
             _lastSpokenText = message;
             _lastSpokenTicks = now;
             _lastTolkCallTicks = now;
-            _tolkCallsThisSecond++;
             _lastMessage = message;
 
-            try { MelonLogger.Msg($"[SRWYAccess] [SR] {message}"); } catch { }
+            DebugHelper.Write($"[SR] {message}");
 
             if (!_loaded) return;
 
@@ -163,7 +149,7 @@ namespace SRWYAccess
             }
             catch (Exception ex)
             {
-                try { MelonLogger.Error($"[SRWYAccess] Tolk_Output failed: {ex.Message}"); } catch { }
+                DebugHelper.Write($"Tolk_Output failed: {ex.Message}");
             }
         }
 
@@ -182,32 +168,16 @@ namespace SRWYAccess
             if (message == _lastSpokenText && (now - _lastSpokenTicks) < DedupWindowTicks)
                 return;
 
-            // Rate limiting: enforce minimum interval between ANY calls
+            // Rate limiting: enforce minimum interval
             if ((now - _lastTolkCallTicks) < MinTolkIntervalTicks)
-            {
-                try { MelonLogger.Warning($"[SRWYAccess] [SR+-THROTTLED] {message}"); } catch { }
                 return;
-            }
-
-            // Rate limiting: per-second call counter
-            if (now - _tolkCallsSecondStart > TimeSpan.TicksPerSecond)
-            {
-                _tolkCallsThisSecond = 0;
-                _tolkCallsSecondStart = now;
-            }
-            if (_tolkCallsThisSecond >= MaxTolkCallsPerSecond)
-            {
-                try { MelonLogger.Warning($"[SRWYAccess] [SR+-RATELIMIT] {message}"); } catch { }
-                return;
-            }
 
             _lastSpokenText = message;
             _lastSpokenTicks = now;
             _lastTolkCallTicks = now;
-            _tolkCallsThisSecond++;
             _lastMessage = message;
 
-            try { MelonLogger.Msg($"[SRWYAccess] [SR+] {message}"); } catch { }
+            DebugHelper.Write($"[SR+] {message}");
 
             if (!_loaded) return;
 
@@ -217,7 +187,7 @@ namespace SRWYAccess
             }
             catch (Exception ex)
             {
-                try { MelonLogger.Error($"[SRWYAccess] Tolk_Output failed: {ex.Message}"); } catch { }
+                DebugHelper.Write($"Tolk_Output(queued) failed: {ex.Message}");
             }
         }
 
@@ -234,7 +204,7 @@ namespace SRWYAccess
             }
             catch (Exception ex)
             {
-                MelonLogger.Error($"[SRWYAccess] Tolk_Silence failed: {ex.Message}");
+                DebugHelper.Write($"Tolk_Silence failed: {ex.Message}");
             }
         }
 

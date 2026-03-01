@@ -1,6 +1,7 @@
 using System;
 using System.Collections.Generic;
-using System.Runtime.InteropServices;
+using UnityEngine;
+using Il2CppInterop.Runtime.InteropTypes.Arrays;
 
 namespace SRWYAccess
 {
@@ -16,8 +17,14 @@ namespace SRWYAccess
     }
 
     /// <summary>
-    /// Manages audio cue playback using in-memory WAV generation
-    /// and Windows PlaySound API. No external audio files required.
+    /// Manages audio cue playback using Unity's AudioSource system.
+    /// Routes through Unity's audio pipeline (same as the game), eliminating
+    /// conflicts with the game's audio subsystem that occurred with winmm.dll
+    /// PlaySound. Works reliably on all hardware configurations.
+    ///
+    /// Two-phase initialization:
+    ///   Phase 1 (Initialize): Pre-generates float[] sample data on background thread.
+    ///   Phase 2 (EnsureMainThreadInit): Creates Unity AudioSource + AudioClips on main thread.
     ///
     /// Three distinct sounds for map cursor:
     ///   Empty = soft low triangle wave "tock"
@@ -26,48 +33,101 @@ namespace SRWYAccess
     /// </summary>
     public static class AudioCueManager
     {
-        [DllImport("winmm.dll", SetLastError = true)]
-        private static extern bool PlaySound(IntPtr pszSound, IntPtr hmod, uint fdwSound);
-
-        private const uint SND_MEMORY = 0x0004;
-        private const uint SND_ASYNC = 0x0001;
-        private const uint SND_NODEFAULT = 0x0002;
-
-        private const int SampleRate = 22050;
-        private const int BitsPerSample = 16;
+        private const int SampleRate = 48000;
         private const int Channels = 1;
-        private const int FadeMs = 2; // fade-in/fade-out to avoid click artifacts
+        private const int FadeMs = 5; // fade-in/fade-out to avoid click artifacts
 
+        // Phase 1 state: sample data generated on background thread
+        private static bool _samplesReady;
+        private static readonly Dictionary<AudioCue, float[]> _sampleData = new();
+
+        // Phase 2 state: Unity objects created on main thread
         private static bool _initialized;
-        private static readonly Dictionary<AudioCue, IntPtr> _buffers = new();
-        private static readonly Dictionary<AudioCue, int> _bufferSizes = new();
+        private static GameObject _audioGO;
+        private static AudioSource _audioSource;
+        private static readonly Dictionary<AudioCue, AudioClip> _clips = new();
 
         // Deduplication: prevent same cue from playing twice within DedupMs
         private static AudioCue _lastCue;
         private static long _lastPlayTicks;
 
         /// <summary>
-        /// Initialize audio cue system. Generate all tone buffers.
-        /// Call once during mod init (Phase 7).
+        /// Phase 1: Generate sample data. Safe to call from any thread.
+        /// Called during mod init (background thread, Phase 7).
+        /// Unity AudioClip creation is deferred to EnsureMainThreadInit().
         /// </summary>
         public static void Initialize()
         {
             try
             {
                 GenerateAllCues();
-                _initialized = true;
-                DebugHelper.Write($"AudioCueManager: initialized, {_buffers.Count} cues loaded");
+                _samplesReady = true;
+                DebugHelper.Write($"AudioCueManager: {_sampleData.Count} cues generated (samples ready)");
             }
             catch (Exception ex)
             {
-                DebugHelper.Write($"AudioCueManager: init failed: {ex.Message}");
+                DebugHelper.Write($"AudioCueManager: sample generation failed: {ex.Message}");
+                _samplesReady = false;
+            }
+        }
+
+        /// <summary>
+        /// Phase 2: Create Unity AudioSource and AudioClips from pre-generated samples.
+        /// Must be called on Unity main thread. Called once from OnMainThreadUpdate.
+        /// Creates a hidden persistent GameObject with AudioSource that bypasses
+        /// all game audio effects (reverb, EQ, etc.) for clean cue playback.
+        /// </summary>
+        public static void EnsureMainThreadInit()
+        {
+            if (_initialized || !_samplesReady) return;
+
+            try
+            {
+                // Create persistent hidden GameObject with AudioSource
+                _audioGO = new GameObject("SRWYAccess_Audio");
+                UnityEngine.Object.DontDestroyOnLoad(_audioGO);
+                _audioGO.hideFlags = HideFlags.HideAndDontSave;
+
+                _audioSource = _audioGO.AddComponent<AudioSource>();
+                _audioSource.spatialBlend = 0f;              // 2D sound (no spatialization)
+                _audioSource.bypassEffects = true;            // skip game audio effects
+                _audioSource.bypassListenerEffects = true;    // skip listener effects
+                _audioSource.bypassReverbZones = true;        // skip reverb zones
+                _audioSource.volume = 1.0f;                   // volume baked into samples
+                _audioSource.playOnAwake = false;
+
+                // Create AudioClips from pre-generated sample data
+                foreach (var kvp in _sampleData)
+                {
+                    var samples = kvp.Value;
+                    var clip = AudioClip.Create(kvp.Key.ToString(), samples.Length, Channels, SampleRate, false);
+
+                    // Convert managed float[] to IL2CPP array for SetData
+                    var il2cppSamples = new Il2CppStructArray<float>(samples.Length);
+                    for (int i = 0; i < samples.Length; i++)
+                        il2cppSamples[i] = samples[i];
+
+                    clip.SetData(il2cppSamples, 0);
+                    _clips[kvp.Key] = clip;
+                }
+
+                // Free managed sample arrays (no longer needed)
+                _sampleData.Clear();
+
+                _initialized = true;
+                DebugHelper.Write($"AudioCueManager: Unity AudioSource initialized, {_clips.Count} clips loaded");
+            }
+            catch (Exception ex)
+            {
+                DebugHelper.Write($"AudioCueManager: main thread init failed: {ex.Message}");
                 _initialized = false;
             }
         }
 
         /// <summary>
-        /// Play an audio cue. Non-blocking (SND_ASYNC).
-        /// Safe to call from any context — never throws.
+        /// Play an audio cue. Non-blocking.
+        /// Safe to call from main thread context - never throws.
+        /// Setting clip + Play() interrupts any previous cue automatically.
         /// </summary>
         public static void Play(AudioCue cue)
         {
@@ -82,15 +142,16 @@ namespace SRWYAccess
                 if (cue == _lastCue && (now - _lastPlayTicks) < dedupTicks)
                     return;
 
-                if (!_buffers.TryGetValue(cue, out IntPtr buffer) || buffer == IntPtr.Zero)
+                if (!_clips.TryGetValue(cue, out var clip) || (object)clip == null)
                     return;
 
-                bool result = PlaySound(buffer, IntPtr.Zero, SND_MEMORY | SND_ASYNC | SND_NODEFAULT);
+                // Verify AudioSource is still alive (IL2CPP object check)
+                if ((object)_audioSource == null) return;
+
+                _audioSource.clip = clip;
+                _audioSource.Play();
                 _lastCue = cue;
                 _lastPlayTicks = now;
-
-                if (!result)
-                    DebugHelper.Write($"AudioCue: PlaySound returned false for {cue}");
             }
             catch (Exception ex)
             {
@@ -103,11 +164,43 @@ namespace SRWYAccess
         /// </summary>
         public static void Stop()
         {
+            if (!_initialized) return;
             try
             {
-                PlaySound(IntPtr.Zero, IntPtr.Zero, SND_ASYNC);
+                if ((object)_audioSource != null)
+                    _audioSource.Stop();
             }
             catch { }
+        }
+
+        /// <summary>
+        /// Cleanup on mod shutdown. Nulls references and clears state.
+        /// Does not call Unity Object.Destroy (may not be on main thread).
+        /// </summary>
+        public static void Shutdown()
+        {
+            if (!_initialized && !_samplesReady) return;
+
+            try
+            {
+                if ((object)_audioSource != null)
+                {
+                    try { _audioSource.Stop(); } catch { }
+                }
+
+                _clips.Clear();
+                _sampleData.Clear();
+                _audioGO = null;
+                _audioSource = null;
+                _initialized = false;
+                _samplesReady = false;
+
+                DebugHelper.Write("AudioCueManager: shutdown complete");
+            }
+            catch (Exception ex)
+            {
+                DebugHelper.Write($"AudioCueManager: shutdown error: {ex.Message}");
+            }
         }
 
         private static void GenerateAllCues()
@@ -115,78 +208,70 @@ namespace SRWYAccess
             float vol = ModConfig.AudioCueVolume;
 
             // Empty tile: soft low triangle wave "tock" (single short note)
-            AddCue(AudioCue.TileEmpty, GenerateTriangleTone(330, 50, vol * 0.7f));
+            _sampleData[AudioCue.TileEmpty] = GenerateTriangleTone(330, 50, vol * 0.7f);
 
             // Ally unit: two quick ascending sine beeps "di-dip"
-            AddCue(AudioCue.TileAlly, GenerateDoubleBeep(480, 640, 35, 20, vol));
+            _sampleData[AudioCue.TileAlly] = GenerateDoubleBeep(480, 640, 35, 20, vol);
 
             // Enemy unit: harsh square wave buzz "bzzt"
-            AddCue(AudioCue.TileEnemy, GenerateSquareBuzz(880, 12, 80, vol));
-        }
-
-        private static void AddCue(AudioCue cue, byte[] wavData)
-        {
-            if (wavData == null || wavData.Length == 0) return;
-
-            IntPtr ptr = Marshal.AllocHGlobal(wavData.Length);
-            Marshal.Copy(wavData, 0, ptr, wavData.Length);
-            _buffers[cue] = ptr;
-            _bufferSizes[cue] = wavData.Length;
+            _sampleData[AudioCue.TileEnemy] = GenerateSquareBuzz(880, 12, 80, vol);
         }
 
         /// <summary>
         /// Triangle wave: softer, rounder than sine. Good for neutral/empty cue.
+        /// Output range: [-1.0, 1.0] scaled by volume.
         /// </summary>
-        private static byte[] GenerateTriangleTone(int frequencyHz, int durationMs, float volume)
+        private static float[] GenerateTriangleTone(int frequencyHz, int durationMs, float volume)
         {
             int sampleCount = SampleRate * durationMs / 1000;
             int fadeSamples = SampleRate * FadeMs / 1000;
-            short[] samples = new short[sampleCount];
-            double amplitude = short.MaxValue * Math.Min(volume, 1.0);
+            float[] samples = new float[sampleCount];
+            float amplitude = Math.Min(volume, 1.0f);
 
             for (int i = 0; i < sampleCount; i++)
             {
                 double t = (double)i / SampleRate;
                 // Triangle wave via asin(sin(x))
                 double phase = 2.0 * Math.PI * frequencyHz * t;
-                double value = Math.Asin(Math.Sin(phase)) * (2.0 / Math.PI) * amplitude;
+                float value = (float)(Math.Asin(Math.Sin(phase)) * (2.0 / Math.PI) * amplitude);
 
                 // Fade-in/out
                 if (i < fadeSamples)
-                    value *= (double)i / fadeSamples;
+                    value *= (float)i / fadeSamples;
                 if (i >= sampleCount - fadeSamples)
-                    value *= (double)(sampleCount - 1 - i) / fadeSamples;
+                    value *= (float)(sampleCount - 1 - i) / fadeSamples;
 
-                samples[i] = Clamp(value);
+                samples[i] = ClampF(value);
             }
 
-            return BuildWav(samples);
+            return samples;
         }
 
         /// <summary>
         /// Two quick ascending sine beeps with a gap. Friendly "di-dip" pattern.
+        /// Output range: [-1.0, 1.0] scaled by volume.
         /// </summary>
-        private static byte[] GenerateDoubleBeep(int freq1, int freq2, int beepMs, int gapMs, float volume)
+        private static float[] GenerateDoubleBeep(int freq1, int freq2, int beepMs, int gapMs, float volume)
         {
             int beepSamples = SampleRate * beepMs / 1000;
             int gapSamples = SampleRate * gapMs / 1000;
             int totalSamples = beepSamples + gapSamples + beepSamples;
             int fadeSamples = SampleRate * FadeMs / 1000;
-            short[] samples = new short[totalSamples];
-            double amplitude = short.MaxValue * Math.Min(volume, 1.0);
+            float[] samples = new float[totalSamples];
+            float amplitude = Math.Min(volume, 1.0f);
 
             // First beep (lower pitch)
             for (int i = 0; i < beepSamples; i++)
             {
                 double t = (double)i / SampleRate;
-                double value = Math.Sin(2.0 * Math.PI * freq1 * t) * amplitude;
+                float value = (float)(Math.Sin(2.0 * Math.PI * freq1 * t) * amplitude);
 
                 if (i < fadeSamples)
-                    value *= (double)i / fadeSamples;
+                    value *= (float)i / fadeSamples;
                 if (i >= beepSamples - fadeSamples)
-                    value *= (double)(beepSamples - 1 - i) / fadeSamples;
+                    value *= (float)(beepSamples - 1 - i) / fadeSamples;
 
-                samples[i] = Clamp(value);
+                samples[i] = ClampF(value);
             }
 
             // Gap: silence (already 0)
@@ -196,29 +281,30 @@ namespace SRWYAccess
             for (int i = 0; i < beepSamples; i++)
             {
                 double t = (double)i / SampleRate;
-                double value = Math.Sin(2.0 * Math.PI * freq2 * t) * amplitude;
+                float value = (float)(Math.Sin(2.0 * Math.PI * freq2 * t) * amplitude);
 
                 if (i < fadeSamples)
-                    value *= (double)i / fadeSamples;
+                    value *= (float)i / fadeSamples;
                 if (i >= beepSamples - fadeSamples)
-                    value *= (double)(beepSamples - 1 - i) / fadeSamples;
+                    value *= (float)(beepSamples - 1 - i) / fadeSamples;
 
-                samples[offset + i] = Clamp(value);
+                samples[offset + i] = ClampF(value);
             }
 
-            return BuildWav(samples);
+            return samples;
         }
 
         /// <summary>
         /// Square wave with amplitude modulation (tremolo). Creates a harsh "bzzt" buzz.
         /// tremoloHz controls how fast the volume pulses (higher = more aggressive).
+        /// Output range: [-1.0, 1.0] scaled by volume.
         /// </summary>
-        private static byte[] GenerateSquareBuzz(int frequencyHz, int tremoloHz, int durationMs, float volume)
+        private static float[] GenerateSquareBuzz(int frequencyHz, int tremoloHz, int durationMs, float volume)
         {
             int sampleCount = SampleRate * durationMs / 1000;
             int fadeSamples = SampleRate * FadeMs / 1000;
-            short[] samples = new short[sampleCount];
-            double amplitude = short.MaxValue * Math.Min(volume, 1.0);
+            float[] samples = new float[sampleCount];
+            float amplitude = Math.Min(volume, 1.0f);
 
             for (int i = 0; i < sampleCount; i++)
             {
@@ -230,84 +316,25 @@ namespace SRWYAccess
                 // Tremolo (amplitude modulation): pulsing between 0.3 and 1.0
                 double tremolo = 0.65 + 0.35 * Math.Sin(2.0 * Math.PI * tremoloHz * t);
 
-                double value = square * tremolo * amplitude;
+                float value = (float)(square * tremolo * amplitude);
 
                 // Fade-in/out
                 if (i < fadeSamples)
-                    value *= (double)i / fadeSamples;
+                    value *= (float)i / fadeSamples;
                 if (i >= sampleCount - fadeSamples)
-                    value *= (double)(sampleCount - 1 - i) / fadeSamples;
+                    value *= (float)(sampleCount - 1 - i) / fadeSamples;
 
-                samples[i] = Clamp(value);
+                samples[i] = ClampF(value);
             }
 
-            return BuildWav(samples);
+            return samples;
         }
 
-        private static short Clamp(double value)
+        private static float ClampF(float value)
         {
-            if (value > short.MaxValue) return short.MaxValue;
-            if (value < short.MinValue) return short.MinValue;
-            return (short)value;
-        }
-
-        /// <summary>
-        /// Build a complete WAV file (RIFF header + PCM data) from sample array.
-        /// </summary>
-        private static byte[] BuildWav(short[] samples)
-        {
-            int dataSize = samples.Length * (BitsPerSample / 8);
-            int fileSize = 44 + dataSize; // 44-byte header + data
-            byte[] wav = new byte[fileSize];
-            int pos = 0;
-
-            // RIFF header
-            WriteBytes(wav, ref pos, "RIFF");
-            WriteInt32(wav, ref pos, fileSize - 8);  // chunk size
-            WriteBytes(wav, ref pos, "WAVE");
-
-            // fmt sub-chunk
-            WriteBytes(wav, ref pos, "fmt ");
-            WriteInt32(wav, ref pos, 16);             // sub-chunk size (PCM)
-            WriteInt16(wav, ref pos, 1);              // audio format (1 = PCM)
-            WriteInt16(wav, ref pos, (short)Channels);
-            WriteInt32(wav, ref pos, SampleRate);
-            WriteInt32(wav, ref pos, SampleRate * Channels * BitsPerSample / 8); // byte rate
-            WriteInt16(wav, ref pos, (short)(Channels * BitsPerSample / 8));     // block align
-            WriteInt16(wav, ref pos, (short)BitsPerSample);
-
-            // data sub-chunk
-            WriteBytes(wav, ref pos, "data");
-            WriteInt32(wav, ref pos, dataSize);
-
-            // PCM samples
-            for (int i = 0; i < samples.Length; i++)
-            {
-                wav[pos++] = (byte)(samples[i] & 0xFF);
-                wav[pos++] = (byte)((samples[i] >> 8) & 0xFF);
-            }
-
-            return wav;
-        }
-
-        private static void WriteBytes(byte[] buf, ref int pos, string text)
-        {
-            for (int i = 0; i < text.Length; i++)
-                buf[pos++] = (byte)text[i];
-        }
-
-        private static void WriteInt32(byte[] buf, ref int pos, int value)
-        {
-            buf[pos++] = (byte)(value & 0xFF);
-            buf[pos++] = (byte)((value >> 8) & 0xFF);
-            buf[pos++] = (byte)((value >> 16) & 0xFF);
-            buf[pos++] = (byte)((value >> 24) & 0xFF);
-        }
-
-        private static void WriteInt16(byte[] buf, ref int pos, short value)
-        {
-            buf[pos++] = (byte)(value & 0xFF);
-            buf[pos++] = (byte)((value >> 8) & 0xFF);
+            if (value > 1.0f) return 1.0f;
+            if (value < -1.0f) return -1.0f;
+            return value;
         }
     }
 }
